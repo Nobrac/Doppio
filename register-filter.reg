@@ -1,0 +1,7 @@
+Windows Registry Editor Version 5.00
+
+; Step 2: the filter. Hides every other tile (password, PIN, Hello).
+; Import this ONLY after an enrolled account can log on through the 2FA tile.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Provider Filters\{B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE02}]
+@="TheAdminCafe 2FA Credential Provider Filter"

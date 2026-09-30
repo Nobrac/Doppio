@@ -1,0 +1,28 @@
+Windows Registry Editor Version 5.00
+
+; Step 1: COM registration + provider. Does NOT hide any other tile.
+; GUIDs here MUST match guid.h. Regenerate both before using this anywhere.
+;   provider {B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE01}
+;   filter   {B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE02}
+; The DLL lives under Program Files so only admins can replace it.
+
+[HKEY_CLASSES_ROOT\CLSID\{B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE01}]
+@="TheAdminCafe 2FA Credential Provider"
+[HKEY_CLASSES_ROOT\CLSID\{B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE01}\InprocServer32]
+@="C:\\Program Files\\TheAdminCafe\\TacProvider.dll"
+"ThreadingModel"="Apartment"
+
+[HKEY_CLASSES_ROOT\CLSID\{B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE02}]
+@="TheAdminCafe 2FA Credential Provider Filter"
+[HKEY_CLASSES_ROOT\CLSID\{B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE02}\InprocServer32]
+@="C:\\Program Files\\TheAdminCafe\\TacProvider.dll"
+"ThreadingModel"="Apartment"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE01}]
+@="TheAdminCafe 2FA Credential Provider"
+
+; Event log source for the 2FA events (Application log). EventCreate.exe has a
+; message table that prints the text as it is (%1) for the IDs 1 to 1000.
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\EventLog\Application\TheAdminCafe 2FA]
+"EventMessageFile"=hex(2):25,00,53,00,79,00,73,00,74,00,65,00,6d,00,52,00,6f,00,6f,00,74,00,25,00,5c,00,53,00,79,00,73,00,74,00,65,00,6d,00,33,00,32,00,5c,00,45,00,76,00,65,00,6e,00,74,00,43,00,72,00,65,00,61,00,74,00,65,00,2e,00,65,00,78,00,65,00,00,00
+"TypesSupported"=dword:00000007

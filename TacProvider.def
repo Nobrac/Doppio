@@ -1,0 +1,4 @@
+LIBRARY   TacProvider
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE

@@ -1,0 +1,21 @@
+# Build output
+*.dll
+*.exe
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+build/
+out/
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.user
+
+# Python
+__pycache__/
+
+# Created by new-guids.ps1
+unregister-old.reg
