@@ -10,9 +10,17 @@ HRESULT SplitDomainAndUsername(PCWSTR pszQualifiedUserName,
                                PWSTR pszDomain, int cchDomain,
                                PWSTR pszUsername, int cchUsername);
 
+// Copies the password for the serialization and, for logon and unlock,
+// encrypts the copy with CredProtectW as Microsoft's sample does. A password
+// that is already protected (RDP can forward one) is copied as it is.
 HRESULT ProtectIfNecessaryAndCopyPassword(PCWSTR pwzPassword,
                                           CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
                                           PWSTR* ppwzProtectedPassword);
+
+// The opposite, for code that needs the plain text (the LogonUser password
+// check): a protected password is decrypted, a plain one is copied. The caller
+// wipes and frees the result with CoTaskMemFree.
+HRESULT CopyUnprotectedPassword(PCWSTR pwzPassword, PWSTR* ppwzPlain);
 
 // Fills the structure with pointers to the caller's strings (no copies).
 HRESULT KerbInteractiveUnlockLogonInit(PWSTR pwzDomain, PWSTR pwzUsername, PWSTR pwzPassword,

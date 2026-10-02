@@ -70,6 +70,9 @@ private:
 
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv)
 {
+    if (!ppv)
+        return E_POINTER;
+    *ppv = nullptr;
     if (!IsEqualCLSID(rclsid, CLSID_CTacProvider) && !IsEqualCLSID(rclsid, CLSID_CTacFilter))
         return CLASS_E_CLASSNOTAVAILABLE;
 
@@ -84,7 +87,7 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv)
 
 STDAPI DllCanUnloadNow()
 {
-    return g_cRef == 0 ? S_OK : S_FALSE;
+    return InterlockedCompareExchange(&g_cRef, 0, 0) == 0 ? S_OK : S_FALSE;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID)

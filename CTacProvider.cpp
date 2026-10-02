@@ -123,14 +123,20 @@ HRESULT CTacProvider::_AddCredential(PCWSTR pwzUser, PCWSTR pwzPassword, PCWSTR 
 
     HRESULT hr = cred->Initialize(_cpus, s_rgFieldDescriptors, s_rgFieldStatePairs,
                                   pwzUser, pwzPassword, pwzSid);
-    if (FAILED(hr))
+    if (SUCCEEDED(hr))
     {
-        cred->Release();
-        return hr;
+        try
+        {
+            _credentials.push_back(cred);
+            return S_OK;
+        }
+        catch (...)   // std::bad_alloc must not cross into LogonUI
+        {
+            hr = E_OUTOFMEMORY;
+        }
     }
-
-    _credentials.push_back(cred);
-    return S_OK;
+    cred->Release();
+    return hr;
 }
 
 HRESULT CTacProvider::_CreateCredentials()
@@ -142,8 +148,10 @@ HRESULT CTacProvider::_CreateCredentials()
     // RDP path: one tile, pre-filled with the forwarded name and password.
     if (_haveRemote)
     {
-        if (SUCCEEDED(_AddCredential(_remoteUser.c_str(), _remotePassword.c_str(), nullptr)))
-            _defaultIndex = 0;
+        HRESULT hr = _AddCredential(_remoteUser.c_str(), _remotePassword.c_str(), nullptr);
+        if (FAILED(hr))
+            return hr;      // keep the forwarded credential for LogonUI's next try
+        _defaultIndex = 0;
 
         // The tile has its own copy now, so drop ours.
         if (!_remotePassword.empty())
@@ -155,11 +163,15 @@ HRESULT CTacProvider::_CreateCredentials()
         return S_OK;
     }
 
+    // One tile per listed local user. A user that cannot be read is skipped,
+    // but an out-of-memory condition is reported to LogonUI
+    // instead of pretending the enumeration worked.
     DWORD count = 0;
-    if (_pUserArray)
-        _pUserArray->GetCount(&count);
+    if (_pUserArray && FAILED(_pUserArray->GetCount(&count)))
+        count = 0;
 
-    for (DWORD i = 0; i < count; ++i)
+    HRESULT hr = S_OK;
+    for (DWORD i = 0; i < count && hr != E_OUTOFMEMORY; ++i)
     {
         ICredentialProviderUser* user = nullptr;
         if (FAILED(_pUserArray->GetAt(i, &user)) || !user)
@@ -167,22 +179,26 @@ HRESULT CTacProvider::_CreateCredentials()
 
         PWSTR qualified = nullptr;
         PWSTR sid       = nullptr;
-        user->GetStringValue(PKEY_QualifiedUserName, &qualified);
-        user->GetSid(&sid);
-
-        if (qualified && sid && IsLocalAccount(qualified))
-            _AddCredential(qualified, L"", sid);
+        if (SUCCEEDED(user->GetStringValue(PKEY_QualifiedUserName, &qualified)) &&
+            SUCCEEDED(user->GetSid(&sid)) &&
+            qualified && sid && IsLocalAccount(qualified))
+            hr = _AddCredential(qualified, L"", sid);
 
         CoTaskMemFree(qualified);
         CoTaskMemFree(sid);
         user->Release();
     }
 
-    // If no local user tile was created (for example when Windows does not list
-    // local users), add one generic tile with a username field. Without it the
-    // filter could leave nobody a way to log on.
-    if (_credentials.empty())
-        _AddCredential(L"", L"", nullptr);
+    // Always one generic tile with a username field ("Other user") at logon.
+    // With the filter on, this is the only way in for an account Windows does
+    // not list: a hidden break-glass admin, or any account when Windows lists
+    // no users at all. On the unlock screen it is only added if nothing else
+    // could be created.
+    if (hr != E_OUTOFMEMORY && (_cpus == CPUS_LOGON || _credentials.empty()))
+        hr = _AddCredential(L"", L"", nullptr);
+
+    if (FAILED(hr) && _credentials.empty())
+        return hr;          // nothing usable at all: say so, LogonUI retries later
 
     _built = true;
     return S_OK;
@@ -196,6 +212,10 @@ IFACEMETHODIMP CTacProvider::SetSerialization(
     if (!pcpcs || !pcpcs->rgbSerialization ||
         pcpcs->cbSerialization < sizeof(KERB_INTERACTIVE_UNLOCK_LOGON))
         return E_NOTIMPL;
+    // Domain, name and password are each at most 64 KB (USHORT lengths); a
+    // larger buffer is not a password logon, so do not copy it.
+    if (pcpcs->cbSerialization > sizeof(KERB_INTERACTIVE_UNLOCK_LOGON) + 3 * 0x10000)
+        return E_INVALIDARG;
     if (!IsEqualCLSID(pcpcs->clsidCredentialProvider, CLSID_CTacProvider))
         return E_NOTIMPL;   // not addressed to us
 
@@ -227,20 +247,27 @@ IFACEMETHODIMP CTacProvider::SetSerialization(
             return std::wstring(us.Buffer, us.Length / sizeof(WCHAR));
         };
 
-        std::wstring domain = toString(kil.LogonDomainName);
-        std::wstring user   = toString(kil.UserName);
-        std::wstring pass   = toString(kil.Password);
+        try
+        {
+            std::wstring domain = toString(kil.LogonDomainName);
+            std::wstring user   = toString(kil.UserName);
+            std::wstring pass   = toString(kil.Password);
 
-        if (!_remotePassword.empty())
-            SecureZeroMemory(&_remotePassword[0], _remotePassword.size() * sizeof(WCHAR));
+            if (!_remotePassword.empty())
+                SecureZeroMemory(&_remotePassword[0], _remotePassword.size() * sizeof(WCHAR));
 
-        _remoteUser     = domain.empty() ? user : (domain + L"\\" + user);
-        _remotePassword = pass;
-        _haveRemote     = true;
-        _built          = false;
+            _remoteUser     = domain.empty() ? user : (domain + L"\\" + user);
+            _remotePassword = pass;
+            _haveRemote     = true;
+            _built          = false;
 
-        if (!pass.empty())
-            SecureZeroMemory(&pass[0], pass.size() * sizeof(WCHAR));
+            if (!pass.empty())
+                SecureZeroMemory(&pass[0], pass.size() * sizeof(WCHAR));
+        }
+        catch (...)
+        {
+            hr = E_OUTOFMEMORY;
+        }
     }
 
     SecureZeroMemory(pkiul, pcpcs->cbSerialization);
@@ -253,6 +280,8 @@ IFACEMETHODIMP CTacProvider::UnAdvise() { return S_OK; }
 
 IFACEMETHODIMP CTacProvider::GetFieldDescriptorCount(DWORD* pdwCount)
 {
+    if (!pdwCount)
+        return E_POINTER;
     *pdwCount = TFI_NUM_FIELDS;
     return S_OK;
 }
@@ -268,10 +297,17 @@ IFACEMETHODIMP CTacProvider::GetFieldDescriptorAt(DWORD dwIndex,
 IFACEMETHODIMP CTacProvider::GetCredentialCount(DWORD* pdwCount, DWORD* pdwDefault,
                                                 BOOL* pbAutoLogonWithDefault)
 {
-    _CreateCredentials();
+    if (!pdwCount || !pdwDefault || !pbAutoLogonWithDefault)
+        return E_POINTER;
+    *pdwCount = 0;
+    *pdwDefault = CREDENTIAL_PROVIDER_NO_DEFAULT;
+    *pbAutoLogonWithDefault = FALSE;
+
+    HRESULT hr = _CreateCredentials();
+    if (FAILED(hr))
+        return hr;
     *pdwCount = static_cast<DWORD>(_credentials.size());
     *pdwDefault = _defaultIndex;
-    *pbAutoLogonWithDefault = FALSE;
     return S_OK;
 }
 
@@ -280,7 +316,10 @@ IFACEMETHODIMP CTacProvider::GetCredentialAt(DWORD dwIndex,
 {
     if (!ppcpc)
         return E_INVALIDARG;
-    _CreateCredentials();
+    *ppcpc = nullptr;
+    HRESULT hr = _CreateCredentials();
+    if (FAILED(hr))
+        return hr;
     if (dwIndex >= _credentials.size())
         return E_INVALIDARG;
     return _credentials[dwIndex]->QueryInterface(IID_PPV_ARGS(ppcpc));

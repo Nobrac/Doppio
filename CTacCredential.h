@@ -56,6 +56,13 @@ private:
     void _FreeField(DWORD dwFieldID);
     void _ResetField(DWORD dwFieldID);
 
+    // The body of GetSerialization. May throw std::bad_alloc; GetSerialization
+    // catches it, so no C++ exception ever reaches LogonUI.
+    HRESULT _GetSerializationImpl(CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE* pcpgsr,
+                                  CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* pcpcs,
+                                  PWSTR* ppwszOptionalStatusText,
+                                  CREDENTIAL_PROVIDER_STATUS_ICON* pcpsiOptionalStatusIcon);
+
     LONG                                 _cRef;
     CREDENTIAL_PROVIDER_USAGE_SCENARIO   _cpus;
     CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR _rgFieldDescriptors[TFI_NUM_FIELDS];

@@ -15,6 +15,7 @@ namespace tac
         EVT_NOT_ENROLLED  = 105,
         EVT_ERROR         = 106,
         EVT_PASSWORD_BAD  = 107,   // password refused before the code was checked
+        EVT_LOGON_RESULT  = 108,   // final result from LSA (ReportResult)
     };
 
     // Writes one line of text. Never throws, never shows UI. If the event log

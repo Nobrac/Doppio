@@ -163,6 +163,8 @@ IFACEMETHODIMP CTacCredential::UnAdvise()
 
 IFACEMETHODIMP CTacCredential::SetSelected(BOOL* pbAutoLogon)
 {
+    if (!pbAutoLogon)
+        return E_POINTER;
     *pbAutoLogon = FALSE;   // we always need the code, so never log on automatically
     return S_OK;
 }
@@ -181,6 +183,8 @@ IFACEMETHODIMP CTacCredential::GetFieldState(DWORD dwFieldID,
 {
     if (dwFieldID >= TFI_NUM_FIELDS)
         return E_INVALIDARG;
+    if (!pcpfs || !pcpfis)
+        return E_POINTER;
     *pcpfs  = _rgFieldStatePairs[dwFieldID].cpfs;
     *pcpfis = _rgFieldStatePairs[dwFieldID].cpfis;
     return S_OK;
@@ -190,6 +194,9 @@ IFACEMETHODIMP CTacCredential::GetStringValue(DWORD dwFieldID, PWSTR* ppwsz)
 {
     if (dwFieldID >= TFI_NUM_FIELDS)
         return E_INVALIDARG;
+    if (!ppwsz)
+        return E_POINTER;
+    *ppwsz = nullptr;
     return SHStrDupW(_rgFieldStrings[dwFieldID] ? _rgFieldStrings[dwFieldID] : L"", ppwsz);
 }
 
@@ -315,18 +322,35 @@ enum class PasswordCheck { Ok, Wrong, Refused };
 // the sub-authentication filter of this project block network logons for
 // enrolled accounts. The token is closed right away; the side effect is one
 // extra logon event (4624, type 2, process LogonUI.exe) per sign-in.
+//
+// A password forwarded by RDP can arrive CredProtect-ed; LogonUser needs the
+// plain text, so it is unprotected into a temporary copy that is wiped below.
 static PasswordCheck CheckPassword(PCWSTR domain, PCWSTR user, PCWSTR password, DWORD& error)
 {
     error = ERROR_SUCCESS;
+
+    PWSTR plain = nullptr;
+    HRESULT hr = CopyUnprotectedPassword(password, &plain);
+    if (FAILED(hr))
+    {
+        error = static_cast<DWORD>(HRESULT_CODE(hr));
+        return PasswordCheck::Refused;
+    }
+
     HANDLE token = nullptr;
-    if (LogonUserW(user, domain, password ? password : L"", LOGON32_LOGON_INTERACTIVE,
-                   LOGON32_PROVIDER_DEFAULT, &token))
+    BOOL ok = LogonUserW(user, domain, plain, LOGON32_LOGON_INTERACTIVE,
+                         LOGON32_PROVIDER_DEFAULT, &token);
+    error = ok ? ERROR_SUCCESS : GetLastError();
+
+    SecureZeroMemory(plain, wcslen(plain) * sizeof(WCHAR));
+    CoTaskMemFree(plain);
+
+    if (ok)
     {
         CloseHandle(token);
         return PasswordCheck::Ok;
     }
 
-    error = GetLastError();
     switch (error)
     {
     // These are only reported after the password was accepted. The real logon
@@ -346,15 +370,53 @@ static PasswordCheck CheckPassword(PCWSTR domain, PCWSTR user, PCWSTR password, 
 }
 
 
+// Every output is set before any work starts, like in Microsoft's sample:
+// LogonUI reads the status text and icon on every return, and may read the
+// whole serialization structure. Nothing below may leave one of them
+// indeterminate, and no C++ exception may cross back into LogonUI.
 IFACEMETHODIMP CTacCredential::GetSerialization(
     CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE* pcpgsr,
     CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* pcpcs,
     PWSTR* ppwszOptionalStatusText,
     CREDENTIAL_PROVIDER_STATUS_ICON* pcpsiOptionalStatusIcon)
 {
+    if (!pcpgsr || !pcpcs || !ppwszOptionalStatusText || !pcpsiOptionalStatusIcon)
+        return E_POINTER;
+
     *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
-    pcpcs->rgbSerialization = nullptr;
-    pcpcs->cbSerialization  = 0;
+    ZeroMemory(pcpcs, sizeof(*pcpcs));
+    *ppwszOptionalStatusText = nullptr;
+    *pcpsiOptionalStatusIcon = CPSI_NONE;
+
+    HRESULT hr;
+    try
+    {
+        hr = _GetSerializationImpl(pcpgsr, pcpcs, ppwszOptionalStatusText, pcpsiOptionalStatusIcon);
+    }
+    catch (...)
+    {
+        hr = E_OUTOFMEMORY;
+    }
+
+    if (FAILED(hr))
+    {
+        if (pcpcs->rgbSerialization)
+        {
+            SecureZeroMemory(pcpcs->rgbSerialization, pcpcs->cbSerialization);
+            CoTaskMemFree(pcpcs->rgbSerialization);
+        }
+        ZeroMemory(pcpcs, sizeof(*pcpcs));
+        *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
+    }
+    return hr;
+}
+
+HRESULT CTacCredential::_GetSerializationImpl(
+    CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE* pcpgsr,
+    CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* pcpcs,
+    PWSTR* ppwszOptionalStatusText,
+    CREDENTIAL_PROVIDER_STATUS_ICON* pcpsiOptionalStatusIcon)
+{
 
     // The username field holds "PC\user" on a user tile, or whatever was typed
     // on the fallback tile. We only ever use the bare name, so the account we
@@ -472,17 +534,19 @@ IFACEMETHODIMP CTacCredential::GetSerialization(
         return S_OK;
     }
 
+    // Not "logon succeeded" yet: LSA has the last word, see ReportResult.
     tac::LogEvent(EVENTLOG_INFORMATION_TYPE, tac::EVT_CODE_OK,
-                  L"Valid one-time code for " + who + L" (time step " + std::to_wstring(info.step) +
-                      L"). The password goes to LSA now. " + session + L".");
+                  L"Password and one-time code accepted for " + who +
+                      L". The logon goes to LSA now. " + session + L".");
 
     // --- the ordinary password logon, once both factors are valid ---
+    // Always log on as COMPUTERNAME\user. This is a local-account demo, so we
+    // never authenticate a domain the user might have typed. Built before the
+    // password is copied: from here on nothing may throw while a copy exists.
+    std::wstring qualified = std::wstring(computer) + L"\\" + bare;
+
     PWSTR pwzPassword = nullptr;
     HRESULT hr = ProtectIfNecessaryAndCopyPassword(_rgFieldStrings[TFI_PASSWORD], _cpus, &pwzPassword);
-
-    // Always log on as COMPUTERNAME\user. This is a local-account demo, so we
-    // never authenticate a domain the user might have typed.
-    std::wstring qualified = std::wstring(computer) + L"\\" + bare;
 
     WCHAR domain[64] = {};
     WCHAR user[256]  = {};
@@ -526,21 +590,34 @@ IFACEMETHODIMP CTacCredential::GetSerialization(
     return hr;
 }
 
-// LSA reports the result of the logon here. If it failed, clear password and
-// code like the built-in tile does (the code is used up anyway). The password
-// was already checked before the code, so a failure here is rare (the password
-// was changed in between, or a logon right is missing).
-IFACEMETHODIMP CTacCredential::ReportResult(NTSTATUS ntsStatus, NTSTATUS,
+// LSA reports the result of the logon here. Password and code are cleared in
+// every case: after a success they are not needed anymore, and after a failure
+// the code is used up anyway. The password was already checked before the
+// code, so a failure here is rare (the password was changed in between, or a
+// logon right is missing). This is also where the final outcome is logged.
+IFACEMETHODIMP CTacCredential::ReportResult(NTSTATUS ntsStatus, NTSTATUS ntsSubstatus,
                                             PWSTR* ppwszOptionalStatusText,
                                             CREDENTIAL_PROVIDER_STATUS_ICON* pcpsiOptionalStatusIcon)
 {
+    if (!ppwszOptionalStatusText || !pcpsiOptionalStatusIcon)
+        return E_POINTER;
     *ppwszOptionalStatusText = nullptr;
     *pcpsiOptionalStatusIcon = CPSI_NONE;
 
-    if (ntsStatus != 0)
+    _ResetField(TFI_PASSWORD);
+    _ResetField(TFI_OTP);
+
+    wchar_t text[96];
+    swprintf_s(text, L"Logon finished: status 0x%08lX, substatus 0x%08lX.",
+               static_cast<unsigned long>(ntsStatus), static_cast<unsigned long>(ntsSubstatus));
+    try
     {
-        _ResetField(TFI_PASSWORD);
-        _ResetField(TFI_OTP);
+        tac::LogEvent(ntsStatus == 0 ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_WARNING_TYPE,
+                      tac::EVT_LOGON_RESULT, text);
+    }
+    catch (...)
+    {
+        // Logging is best effort; never let it reach LogonUI.
     }
 
     if (ntsStatus == STATUS_LOGON_FAILURE)

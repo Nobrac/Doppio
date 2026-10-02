@@ -2,25 +2,29 @@
 #include <shlwapi.h>
 #include <strsafe.h>
 
+#include <wincred.h>
+
 #define SECURITY_WIN32
 #include <security.h>
 
 #pragma comment(lib, "secur32.lib")
+#pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
-static void InitUnicodeString(UNICODE_STRING* pus, PWSTR pwz)
+static bool InitUnicodeString(UNICODE_STRING* pus, PWSTR pwz)
 {
-    // A UNICODE_STRING length is a USHORT (bytes). Cap the character count so
-    // len * sizeof(WCHAR) can never wrap to a small value while Buffer still
-    // points at the full string. No real password comes close to this.
+    // A UNICODE_STRING length is a USHORT (bytes). A longer string is refused
+    // rather than cut: silently logging on with a truncated password would be
+    // a confusing failure, and len * sizeof(WCHAR) must never wrap.
     size_t len = pwz ? wcslen(pwz) : 0;
     const size_t maxChars = (0xFFFF / sizeof(WCHAR)) - 1;   // 32766
     if (len > maxChars)
-        len = maxChars;
+        return false;
 
     pus->Length        = static_cast<USHORT>(len * sizeof(WCHAR));
     pus->MaximumLength = static_cast<USHORT>((len + 1) * sizeof(WCHAR));
     pus->Buffer        = pwz;
+    return true;
 }
 
 // Copies the string to pbDest and stores its offset from pvBase in Buffer.
@@ -72,14 +76,95 @@ HRESULT SplitDomainAndUsername(PCWSTR pszQualifiedUserName,
     return hr;
 }
 
+// CredProtectW and CredUnprotectW work on writable buffers and report the
+// needed size through a first call that fails with ERROR_INSUFFICIENT_BUFFER.
+static HRESULT ProtectCopy(PWSTR pwzWritable, PWSTR* ppwzOut)
+{
+    *ppwzOut = nullptr;
+    DWORD cch = 0;
+    const DWORD cchIn = static_cast<DWORD>(wcslen(pwzWritable) + 1);
+    if (CredProtectW(FALSE, pwzWritable, cchIn, nullptr, &cch, nullptr) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER || cch == 0)
+        return E_FAIL;
+
+    PWSTR out = static_cast<PWSTR>(CoTaskMemAlloc(cch * sizeof(WCHAR)));
+    if (!out)
+        return E_OUTOFMEMORY;
+    if (!CredProtectW(FALSE, pwzWritable, cchIn, out, &cch, nullptr))
+    {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        SecureZeroMemory(out, cch * sizeof(WCHAR));
+        CoTaskMemFree(out);
+        return hr;
+    }
+    *ppwzOut = out;
+    return S_OK;
+}
+
+static HRESULT UnprotectCopy(PWSTR pwzWritable, PWSTR* ppwzOut)
+{
+    *ppwzOut = nullptr;
+    DWORD cch = 0;
+    const DWORD cchIn = static_cast<DWORD>(wcslen(pwzWritable) + 1);
+    if (CredUnprotectW(FALSE, pwzWritable, cchIn, nullptr, &cch) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER || cch == 0)
+        return E_FAIL;
+
+    PWSTR out = static_cast<PWSTR>(CoTaskMemAlloc(cch * sizeof(WCHAR)));
+    if (!out)
+        return E_OUTOFMEMORY;
+    if (!CredUnprotectW(FALSE, pwzWritable, cchIn, out, &cch))
+    {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        SecureZeroMemory(out, cch * sizeof(WCHAR));
+        CoTaskMemFree(out);
+        return hr;
+    }
+    *ppwzOut = out;
+    return S_OK;
+}
+
+// Shared shape of both directions: work on a private writable copy, decide by
+// the protection state, wipe the copy.
+static HRESULT CopyPassword(PCWSTR pwzPassword, bool protect,
+                            CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus, PWSTR* ppwzOut)
+{
+    *ppwzOut = nullptr;
+    if (!pwzPassword || !*pwzPassword)
+        return SHStrDupW(L"", ppwzOut);
+
+    PWSTR copy = nullptr;
+    HRESULT hr = SHStrDupW(pwzPassword, &copy);
+    if (FAILED(hr))
+        return hr;
+
+    CRED_PROTECTION_TYPE type = CredUnprotected;
+    if (!CredIsProtectedW(copy, &type))
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    else if (protect)
+        hr = (cpus != CPUS_CREDUI && type == CredUnprotected)
+            ? ProtectCopy(copy, ppwzOut)
+            : SHStrDupW(copy, ppwzOut);
+    else
+        hr = (type == CredUnprotected)
+            ? SHStrDupW(copy, ppwzOut)
+            : UnprotectCopy(copy, ppwzOut);
+
+    SecureZeroMemory(copy, wcslen(copy) * sizeof(WCHAR));
+    CoTaskMemFree(copy);
+    return hr;
+}
+
 HRESULT ProtectIfNecessaryAndCopyPassword(PCWSTR pwzPassword,
-                                          CREDENTIAL_PROVIDER_USAGE_SCENARIO,
+                                          CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
                                           PWSTR* ppwzProtectedPassword)
 {
-    // The Microsoft sample runs the password through CredProtect first. A plain
-    // copy works for a local logon and keeps this demo small.
-    *ppwzProtectedPassword = nullptr;
-    return SHStrDupW(pwzPassword ? pwzPassword : L"", ppwzProtectedPassword);
+    return CopyPassword(pwzPassword, true, cpus, ppwzProtectedPassword);
+}
+
+HRESULT CopyUnprotectedPassword(PCWSTR pwzPassword, PWSTR* ppwzPlain)
+{
+    return CopyPassword(pwzPassword, false, CPUS_LOGON, ppwzPlain);
 }
 
 HRESULT KerbInteractiveUnlockLogonInit(PWSTR pwzDomain, PWSTR pwzUsername, PWSTR pwzPassword,
@@ -96,9 +181,10 @@ HRESULT KerbInteractiveUnlockLogonInit(PWSTR pwzDomain, PWSTR pwzUsername, PWSTR
     default:                      return E_INVALIDARG;
     }
 
-    InitUnicodeString(&pkil->LogonDomainName, pwzDomain);
-    InitUnicodeString(&pkil->UserName, pwzUsername);
-    InitUnicodeString(&pkil->Password, pwzPassword);
+    if (!InitUnicodeString(&pkil->LogonDomainName, pwzDomain) ||
+        !InitUnicodeString(&pkil->UserName, pwzUsername) ||
+        !InitUnicodeString(&pkil->Password, pwzPassword))
+        return E_INVALIDARG;
     return S_OK;
 }
 
