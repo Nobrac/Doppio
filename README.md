@@ -44,6 +44,22 @@ Only when this works for every account, hide all other sign-in options:
 reg import .\register-filter.reg
 ```
 
+From then on the logon and unlock screens show **only** the 2FA tiles - no
+password tile, no PIN, no Windows Hello. That is the point: with any of them
+left, the code would be optional. Microsoft advises against it, because a
+broken provider then leaves no way in. What is left for recovery:
+
+- The 2FA provider always shows an **"Other user"** tile at logon, so an
+  account Windows does not list (a hidden break-glass admin) can still sign in.
+- While **no account is enrolled at all**, the filter hides nothing. Importing
+  it too early, or after `enroll.exe /purge`, cannot lock you out.
+- If `TacProvider.dll` cannot be loaded, the filter in the same DLL cannot be
+  created either, and Windows shows all sign-in options again. Confirm this once
+  in the VM by renaming the DLL.
+- Otherwise: boot WinRE, load the SOFTWARE hive offline and delete
+  `Microsoft\Windows\CurrentVersion\Authentication\Credential Provider Filters\{B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE02}`
+  (your GUID after `new-guids.ps1`). Practise this before you need it.
+
 The tile checks the **password first** and looks at the code only when the
 password was right. Wrong passwords are counted by Windows, so set an account
 lockout policy as you would without this tile. Wrong codes are counted by the
@@ -57,8 +73,14 @@ the state and the index entries the LSA packages read. Use it before you delete
 the Windows account; `/remove` still cleans up afterwards, but only if you
 remember the name. After renaming an enrolled account, or after updating from a
 version without the RID index, run `enroll.exe /reindex`.
-Uninstall: `reg import .\unregister.reg`, reboot, delete the folder (it also
-holds `state.lock`, which serializes the state updates of parallel logons).
+Uninstall: `enroll.exe /purge` (deletes all secrets, state and indexes), then
+`reg import .\unregister.reg`, reboot, delete the folder (it also holds
+`state.lock`, which serializes the state updates of parallel logons). Without
+`/purge`, the secrets stay in the registry and come back on a reinstall.
+
+Events (Application log, source "TheAdminCafe 2FA"): 100 password and code
+accepted, 101 wrong code, 102 code already used, 103/104 lock, 105 not
+enrolled, 106 state error, 107 password refused, 108 final result from LSA.
 
 ## What the tile does not cover
 
@@ -132,7 +154,8 @@ local accounts on your Windows version is the first thing to check in the VM.
 > debugger. They are **learning skeletons, untested on live LSA.** With LSA
 > protection (RunAsPPL) on - the default on many current Windows 11 installs -
 > lsass refuses to load them at all, because they are not signed. See the
-> article "2FA inside LSA".
+> article "2FA inside LSA". The install scripts refuse to run while LSA
+> protection is on (registry check).
 
 ## Limits
 
@@ -155,7 +178,9 @@ local accounts on your Windows version is the first thing to check in the VM.
 `tests/totp_check.py` checks the algorithm against RFC 6238 in Python.
 `tests/native/` compiles the real `totp.cpp` and `verify.cpp` on Linux, against
 OpenSSL and an in-memory store, and checks the lockout, replay and fail-closed
-behaviour: `make -C tests/native`.
+behaviour: `make -C tests/native`. `.github/workflows/build.yml` runs both, and
+builds everything with MSVC (`/W4 /sdl /guard:cf`, plus `/analyze`) on each push.
+None of this loads anything into LogonUI or lsass; that still needs the VM.
 
 ## License
 

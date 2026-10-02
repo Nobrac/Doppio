@@ -42,7 +42,14 @@ try {
 } catch {
     throw "Could not resolve local account '$User' on $env:COMPUTERNAME."
 }
-Write-Host "$env:COMPUTERNAME\$User -> $sid"
+
+# Only a local USER account. A group typed by mistake ("Users") would deny
+# network, batch and service logon to every member.
+$local = Get-LocalUser -SID $sid -ErrorAction SilentlyContinue
+if (-not $local) {
+    throw "'$User' ($sid) is not a local user account on $env:COMPUTERNAME - a group or another kind of principal? Refusing."
+}
+Write-Host "$env:COMPUTERNAME\$($local.Name) -> $sid"
 
 # On a domain member, a GPO that sets the same rights replaces this local
 # setting at the next policy refresh, silently.
@@ -62,12 +69,15 @@ if ($KeepNetwork -and -not $Remove) {
     $rights = @($rights | Where-Object { $_ -ne 'SeDenyNetworkLogonRight' })
 }
 
-$work = Join-Path $env:TEMP 'tac-secpol'
+# A fresh folder per run, removed again at the end: the export lists every
+# principal of every user right on the machine.
+$work = Join-Path $env:TEMP ('tac-secpol-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force $work | Out-Null
 $exported = Join-Path $work 'exported.inf'
 $apply    = Join-Path $work 'apply.inf'
 $database = Join-Path $work 'tac.sdb'
-Remove-Item $exported, $apply, $database -ErrorAction SilentlyContinue
+
+try {
 
 # 1. Export what the machine has now. We must preserve the existing members of
 #    each right: secedit /configure REPLACES a right's member list wholesale,
@@ -148,3 +158,6 @@ if ($Remove) {
 }
 Write-Host 'Takes effect at the next logon attempt - no reboot needed.'
 Write-Host "Check it with:  secedit /export /areas USER_RIGHTS /cfg con"
+} finally {
+    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+}

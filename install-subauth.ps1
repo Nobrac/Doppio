@@ -16,6 +16,15 @@ $dll = 'TacSubAuth'                          # base name, no extension
 $src = Join-Path $PSScriptRoot "$dll.dll"
 if (-not (Test-Path $src)) { throw "Build $dll.dll first (build.bat)." }
 
+# With LSA protection (RunAsPPL) on, lsass only loads plug-ins with a Microsoft
+# LSA signature. This unsigned DLL would be skipped at boot - silently, from the
+# point of view of whoever expects it to protect something. Refuse instead.
+$lsaKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+$lsaProps = Get-ItemProperty -Path $lsaKey
+if (($lsaProps.RunAsPPL -in 1, 2) -or ($lsaProps.RunAsPPLBoot -in 1, 2)) {
+    throw "LSA protection (RunAsPPL) is on. lsass will not load the unsigned $dll.dll. Turn it off in the test VM first (and back on afterwards)."
+}
+
 $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'
 if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
 $props = Get-ItemProperty -Path $key
@@ -55,5 +64,4 @@ Write-Host '  & "C:\Program Files\TheAdminCafe\enroll.exe" /reindex'
 Write-Host ''
 Write-Host 'Reboot to load it. Refusals are logged (source "TheAdminCafe 2FA", event 210);'
 Write-Host 'every call writes a [Doppio-SubAuth] OutputDebugString line for the kernel debugger.'
-Write-Host 'If LSA protection (RunAsPPL) is on, lsass will not load this unsigned DLL at all.'
 Write-Host 'To remove: run uninstall-subauth.ps1 and reboot.'

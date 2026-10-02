@@ -9,9 +9,9 @@ add_compile_definitions(UNICODE _UNICODE)
 # Without this, LogonUI silently fails to load the DLL on a clean VM.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-# Control Flow Guard for everything: these binaries run in LogonUI and lsass.
+# These binaries run in LogonUI and lsass: Control Flow Guard and SDL checks, warning level 4.
 if(MSVC)
-    add_compile_options(/guard:cf)
+    add_compile_options(/guard:cf /sdl /W4)
     add_link_options(/guard:cf)
 endif()
 

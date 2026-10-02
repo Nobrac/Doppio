@@ -1,0 +1,52 @@
+# Builds everything with MSVC and runs the portable tests on every push.
+# The Windows job is the first place the MSVC build (with /W4 /sdl /guard:cf)
+# actually runs; nothing here loads the DLLs into LogonUI or lsass.
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build (build.bat)
+        shell: cmd
+        run: build.bat
+
+      - name: Check that every binary has Control Flow Guard
+        shell: pwsh
+        run: |
+          foreach ($f in 'TacProvider.dll', 'enroll.exe', 'TacAuthPackage.dll', 'TacSubAuth.dll') {
+            $h = dumpbin /headers $f | Out-String
+            if ($h -notmatch 'Control Flow Guard') { throw "$f was built without Control Flow Guard" }
+            Write-Host "$f : CFG on"
+          }
+
+      - name: Static analysis (/analyze, report only)
+        shell: cmd
+        run: >
+          cl /nologo /c /analyze /W4 /EHsc /std:c++17 /DUNICODE /D_UNICODE
+          dll.cpp CTacProvider.cpp CTacCredential.cpp CTacFilter.cpp helpers.cpp
+          totp.cpp store.cpp verify.cpp statelock.cpp eventlog.cpp enroll.cpp
+          ap.cpp subauth.cpp
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Native C++ tests (real totp.cpp / verify.cpp)
+        run: make -C tests/native
+      - name: Python RFC 6238 check
+        run: python3 tests/totp_check.py

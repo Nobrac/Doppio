@@ -20,6 +20,15 @@ $dll = 'TacAuthPackage'                       # base name, no extension
 $src = Join-Path $PSScriptRoot "$dll.dll"
 if (-not (Test-Path $src)) { throw "Build $dll.dll first (build.bat or build-lsa.bat)." }
 
+# With LSA protection (RunAsPPL) on, lsass only loads plug-ins with a Microsoft
+# LSA signature. This unsigned DLL would be skipped at boot - silently, from the
+# point of view of whoever expects it to protect something. Refuse instead.
+$lsaKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+$lsaProps = Get-ItemProperty -Path $lsaKey
+if (($lsaProps.RunAsPPL -in 1, 2) -or ($lsaProps.RunAsPPLBoot -in 1, 2)) {
+    throw "LSA protection (RunAsPPL) is on. lsass will not load the unsigned $dll.dll. Turn it off in the test VM first (and back on afterwards)."
+}
+
 $key  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
 $name = 'Authentication Packages'
 

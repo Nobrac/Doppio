@@ -16,6 +16,17 @@
 #ifndef STATUS_NOT_IMPLEMENTED
 #define STATUS_NOT_IMPLEMENTED    ((NTSTATUS)0xC0000002L)
 #endif
+#ifndef STATUS_INVALID_PARAMETER
+#define STATUS_INVALID_PARAMETER  ((NTSTATUS)0xC000000DL)
+#endif
+#ifndef STATUS_INSUFFICIENT_RESOURCES
+#define STATUS_INSUFFICIENT_RESOURCES ((NTSTATUS)0xC000009AL)
+#endif
+
+// Every export below runs inside lsass.exe. The helpers use std::wstring,
+// which can throw std::bad_alloc; each export therefore has a catch-all that
+// turns any C++ exception into a failure status. An exception that reached
+// LSA would take lsass, and with it the whole machine, down.
 
 // Kerberos message types we recognise in a submit buffer.
 #ifndef KerbInteractiveLogon
@@ -36,7 +47,9 @@ namespace
     // a code, only metadata.
     void ApLog(WORD type, DWORD id, const std::wstring& text)
     {
-        OutputDebugStringW((L"[Doppio-AP] " + text + L"\n").c_str());
+        OutputDebugStringW(L"[Doppio-AP] ");
+        OutputDebugStringW(text.c_str());
+        OutputDebugStringW(L"\n");
 
         HANDLE h = RegisterEventSourceW(nullptr, L"TheAdminCafe 2FA");
         if (h)
@@ -142,6 +155,10 @@ NTSTATUS NTAPI LsaApInitializePackage(
     PLSA_STRING /*Confidentiality*/,
     PLSA_STRING* AuthenticationPackageName)
 {
+    if (!LsaDispatchTable || !AuthenticationPackageName)
+        return STATUS_INVALID_PARAMETER;
+    *AuthenticationPackageName = nullptr;
+
     g_lsa       = LsaDispatchTable;
     g_packageId = AuthenticationPackageId;
 
@@ -164,8 +181,15 @@ NTSTATUS NTAPI LsaApInitializePackage(
     name->Buffer        = buf;
     *AuthenticationPackageName = name;
 
-    ApLog(EVENTLOG_INFORMATION_TYPE, 200,
-          L"LSA authentication package loaded (id " + std::to_wstring(AuthenticationPackageId) + L").");
+    try
+    {
+        ApLog(EVENTLOG_INFORMATION_TYPE, 200,
+              L"LSA authentication package loaded (id " + std::to_wstring(AuthenticationPackageId) + L").");
+    }
+    catch (...)
+    {
+        // The log line is optional; the package is loaded either way.
+    }
     return STATUS_SUCCESS;
 }
 
@@ -174,8 +198,32 @@ NTSTATUS NTAPI LsaApInitializePackage(
 // to say "this package does not handle this logon". Note: a caller that selects
 // this package by id and gets STATUS_NOT_IMPLEMENTED has its logon fail here; it
 // is not transparently retried against MSV1_0. Standard network/batch logons do
-// not address this package at all - that is what the sub-authentication package
+// not address this package at all - that is what the sub-authentication filter
 // (subauth.cpp) is for. See the article, "deny is easy, success is hard".
+static NTSTATUS LogonUserEx2Impl(SECURITY_LOGON_TYPE LogonType, PVOID ProtocolSubmitBuffer,
+                                 PVOID ClientBufferBase, ULONG SubmitBufferSize, PNTSTATUS SubStatus)
+{
+    const bool nonInteractive = IsNonInteractive(LogonType);
+    const bool enrolled       = nonInteractive &&
+                                IsEnrolledAccount(ProtocolSubmitBuffer, SubmitBufferSize, ClientBufferBase);
+
+    if (nonInteractive && enrolled)
+    {
+        ApLog(EVENTLOG_WARNING_TYPE, 201,
+              std::wstring(L"Denied a ") + LogonTypeName(LogonType) +
+              L" logon for an enrolled account. This path has no second factor.");
+        if (SubStatus) *SubStatus = STATUS_ACCOUNT_RESTRICTION;
+        return STATUS_ACCOUNT_RESTRICTION;
+    }
+
+    // Not "passed on": nothing is forwarded anywhere. The caller asked for this
+    // package, and this package never builds a token, so the logon fails.
+    ApLog(EVENTLOG_INFORMATION_TYPE, 202,
+          std::wstring(L"Declined a ") + LogonTypeName(LogonType) +
+          L" logon addressed to this package. It fails; this package never builds a token.");
+    return STATUS_NOT_IMPLEMENTED;
+}
+
 NTSTATUS NTAPI LsaApLogonUserEx2(
     PLSA_CLIENT_REQUEST /*ClientRequest*/,
     SECURITY_LOGON_TYPE LogonType,
@@ -202,22 +250,16 @@ NTSTATUS NTAPI LsaApLogonUserEx2(
     if (MachineName)              *MachineName = nullptr;
     if (CachedCredentials)        *CachedCredentials = nullptr;
 
-    const bool nonInteractive = IsNonInteractive(LogonType);
-    const bool enrolled       = nonInteractive &&
-                                IsEnrolledAccount(ProtocolSubmitBuffer, SubmitBufferSize, ClientBufferBase);
-
-    if (nonInteractive && enrolled)
+    try
     {
-        ApLog(EVENTLOG_WARNING_TYPE, 201,
-              std::wstring(L"Denied a ") + LogonTypeName(LogonType) +
-              L" logon for an enrolled account. This path has no second factor.");
-        if (SubStatus) *SubStatus = STATUS_ACCOUNT_RESTRICTION;
-        return STATUS_ACCOUNT_RESTRICTION;
+        return LogonUserEx2Impl(LogonType, ProtocolSubmitBuffer, ClientBufferBase,
+                                SubmitBufferSize, SubStatus);
     }
-
-    ApLog(EVENTLOG_INFORMATION_TYPE, 202,
-          std::wstring(L"Passed a ") + LogonTypeName(LogonType) + L" logon to the normal packages.");
-    return STATUS_NOT_IMPLEMENTED;
+    catch (...)
+    {
+        if (SubStatus) *SubStatus = STATUS_INSUFFICIENT_RESOURCES;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 }
 
 static NTSTATUS CallStub(PVOID* ProtocolReturnBuffer, PULONG ReturnBufferLength,

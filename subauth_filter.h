@@ -1,5 +1,9 @@
 #pragma once
 //
+// (Named subauth_filter.h, not subauth.h: with the project folder on the
+// include path, a project header called subauth.h would hide the SDK header
+// of the same name that this file includes.)
+//
 // Doppio MSV1_0 sub-authentication FILTER (SKELETON).
 //
 // MSV1_0 has two sub-authentication hooks, and they are very different:
