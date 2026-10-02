@@ -147,10 +147,40 @@ static bool ConfirmSecret(const std::string& secret, uint64_t& step)
     return ok;
 }
 
+// Deletes every secret, state and index entry. For a full uninstall; the
+// provider registration itself is removed by unregister.reg.
+static int Purge()
+{
+    bool any = false;
+    if (tac::QueryAnyEnrollment(any) && any)
+    {
+        wprintf(L"This deletes ALL 2FA secrets and state on this machine. If the filter is\n");
+        wprintf(L"still registered, the other sign-in options come back immediately.\n");
+        wprintf(L"Continue? [y/N] ");
+        int answer = _getwch();
+        wprintf(L"\n");
+        if (answer != L'y' && answer != L'Y')
+        {
+            wprintf(L"Aborted.\n");
+            return 0;
+        }
+    }
+
+    if (!tac::PurgeAllEnrollments())
+    {
+        wprintf(L"Could not delete HKLM\\SOFTWARE\\TheAdminCafe\\2FA. Run this from an elevated prompt.\n");
+        return 1;
+    }
+    wprintf(L"All 2FA data removed.\n");
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     if (argc == 2 && _wcsicmp(argv[1], L"/reindex") == 0)
         return Reindex();
+    if (argc == 2 && _wcsicmp(argv[1], L"/purge") == 0)
+        return Purge();
 
     bool unlock = argc == 3 && _wcsicmp(argv[1], L"/unlock") == 0;
     bool remove = argc == 3 && _wcsicmp(argv[1], L"/remove") == 0;
@@ -160,6 +190,7 @@ int wmain(int argc, wchar_t** argv)
         wprintf(L"       enroll /unlock <local username>\n");
         wprintf(L"       enroll /remove <local username>\n");
         wprintf(L"       enroll /reindex\n");
+        wprintf(L"       enroll /purge          (delete all 2FA data)\n");
         return 1;
     }
 
@@ -248,8 +279,8 @@ int wmain(int argc, wchar_t** argv)
     tac::StateLock lock;
     if (!lock.Held() || !tac::SaveState(sid, fresh))
     {
-        wprintf(L"The secret was stored, but the old lockout and replay state of '%s'\n", user.c_str());
-        wprintf(L"could not be reset. Run 'enroll /unlock %s' from an elevated prompt.\n", user.c_str());
+        wprintf(L"The secret was stored, but the old lockout state of '%s' could not be\n", user.c_str());
+        wprintf(L"reset. Run 'enroll /unlock %s' from an elevated prompt.\n", user.c_str());
         return 1;
     }
 

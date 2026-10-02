@@ -2,7 +2,7 @@ Windows Registry Editor Version 5.00
 
 ; Removes the filter, the provider and the COM registration.
 ; The enrolled secrets and the lock state under HKLM\SOFTWARE\TheAdminCafe
-; are NOT removed.
+; are NOT removed by this file. Run "enroll.exe /purge" BEFORE importing it.
 
 [-HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Provider Filters\{B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE02}]
 [-HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{B1E7C9A0-2F4D-4C6B-9A11-0000C0FFEE01}]

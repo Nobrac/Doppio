@@ -53,6 +53,16 @@ namespace tac
     // counts as removed.
     bool RemoveEnrollment(const std::wstring& user, const std::wstring& sid);
 
+    // Is at least one account enrolled? Counts the stored secrets (one value per
+    // SID). Returns false if the store exists but cannot be read; a store that
+    // does not exist yet is "readable, nothing enrolled".
+    bool QueryAnyEnrollment(bool& any);
+
+    // Removes everything this project keeps in the registry: secrets, state
+    // and both indexes. For a full uninstall. A tree that is not there counts
+    // as removed.
+    bool PurgeAllEnrollments();
+
     // Rebuilds the RID and name indexes from the stored secrets. For accounts
     // that were enrolled before the RID index existed, and after a rename.
     // Stale name entries of renamed accounts are left alone (they only make the

@@ -358,6 +358,39 @@ namespace tac
         return ok;
     }
 
+    bool QueryAnyEnrollment(bool& any)
+    {
+        any = false;
+        HKEY hKey = nullptr;
+        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKeyPath, 0, KEY_QUERY_VALUE, &hKey);
+        if (status == ERROR_FILE_NOT_FOUND)
+            return true;
+        if (status != ERROR_SUCCESS)
+            return false;
+
+        DWORD values = 0;
+        status = RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                  &values, nullptr, nullptr, nullptr, nullptr);
+        RegCloseKey(hKey);
+        if (status != ERROR_SUCCESS)
+            return false;
+        any = values > 0;
+        return true;
+    }
+
+    bool PurgeAllEnrollments()
+    {
+        // HKLM\SOFTWARE\TheAdminCafe\2FA and everything below it, then the
+        // vendor key if nothing else lives there.
+        LSTATUS status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, kKeyPath);
+        if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND)
+            return false;
+        status = RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\TheAdminCafe");
+        // Not empty (someone else's data) or already gone: both fine.
+        (void)status;
+        return true;
+    }
+
     int ReindexEnrollments()
     {
         HKEY hKey = nullptr;
@@ -445,7 +478,10 @@ namespace tac
         {
             status = RegSetValueExW(hKey, sid.c_str(), 0, REG_BINARY,
                                     reinterpret_cast<const BYTE*>(&state), sizeof(state));
-            RegFlushKey(hKey);   // survive a hard reset right after the logon
+            // No RegFlushKey: it can write out large parts of the hive and
+            // blocks the logon until the disk is done, on every attempt. The
+            // cost of leaving it out is narrow: a hard reset within seconds of
+            // a logon can lose the last state write.
             RegCloseKey(hKey);
         }
         return status == ERROR_SUCCESS;
