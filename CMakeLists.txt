@@ -59,8 +59,9 @@ target_link_libraries(TacAuthPackage PRIVATE
 set_target_properties(TacAuthPackage PROPERTIES
     LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/TacAuthPackage.def\"")
 
-# --- the MSV1_0 sub-authentication package (SKELETON) ---
-# Called by MSV1_0 during its logon processing; MSV1_0 keeps the token work.
+# --- the MSV1_0 sub-authentication filter (SKELETON) ---
+# Registered as Auth0. MSV1_0 calls it AFTER it has validated a logon; it can
+# only veto. MSV1_0 keeps the password check and the token.
 # Same warnings as above: lsass.exe, VM with snapshot only.
 add_library(TacSubAuth SHARED
     subauth.cpp

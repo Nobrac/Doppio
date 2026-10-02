@@ -25,7 +25,7 @@ cl /nologo /LD /MT /O2 /guard:cf /EHsc /std:c++17 /W4 /sdl /DUNICODE /D_UNICODE 
 if errorlevel 1 goto :fail
 
 echo.
-echo === Building TacSubAuth.dll (MSV1_0 sub-authentication package, SKELETON) ===
+echo === Building TacSubAuth.dll (MSV1_0 sub-authentication filter, SKELETON) ===
 cl /nologo /LD /MT /O2 /guard:cf /EHsc /std:c++17 /W4 /sdl /DUNICODE /D_UNICODE ^
    subauth.cpp store.cpp totp.cpp ^
    /Fe:TacSubAuth.dll ^

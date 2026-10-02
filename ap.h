@@ -5,8 +5,8 @@
 // This runs inside LSA (lsass.exe), not in LogonUI. An authentication package
 // is only invoked for logons that address it by package id, so by itself it
 // does NOT see the standard network/batch logon paths - those go to MSV1_0 /
-// Negotiate. To gate those, see the sub-authentication package (subauth.cpp),
-// which MSV1_0 calls during its own processing.
+// Negotiate. To gate those, see the sub-authentication filter (subauth.cpp),
+// which MSV1_0 calls after it has validated a logon.
 //
 // Policy of this skeleton: for an enrolled account, deny every NON-interactive
 // logon that reaches us. Interactive and unlock are left to the credential

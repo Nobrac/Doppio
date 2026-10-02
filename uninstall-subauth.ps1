@@ -15,5 +15,5 @@ if ($props) {
         }
     }
 }
-if (-not $removed) { Write-Host "'$dll' was not registered as a sub-auth package." }
+if (-not $removed) { Write-Host "'$dll' was not registered as a sub-auth filter." }
 Write-Host "Reboot to unload it. You can delete $env:windir\System32\$dll.dll afterwards."
