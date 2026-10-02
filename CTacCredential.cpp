@@ -356,9 +356,13 @@ static PasswordCheck CheckPassword(PCWSTR domain, PCWSTR user, PCWSTR password, 
     // These are only reported after the password was accepted. The real logon
     // below runs into the same condition and Windows handles it there (for
     // example "Allow log on locally" missing for an RDP-only user on a server).
+    // ERROR_ACCOUNT_RESTRICTION is what a correct BLANK password gets outside
+    // the console ("limit blank passwords to console logon"); the real logon
+    // from LogonUI is a console logon, so Windows makes that call there too.
     case ERROR_LOGON_TYPE_NOT_GRANTED:
     case ERROR_PASSWORD_MUST_CHANGE:
     case ERROR_PASSWORD_EXPIRED:
+    case ERROR_ACCOUNT_RESTRICTION:
         return PasswordCheck::Ok;
 
     case ERROR_LOGON_FAILURE:
@@ -445,7 +449,7 @@ HRESULT CTacCredential::_GetSerializationImpl(
         return HRESULT_FROM_WIN32(GetLastError());
 
     // --- the first factor: is the password right? ---
-    DWORD pwError = ERROR_SUCCESS;
+    DWORD pwError = ERROR_NO_SUCH_USER;     // for the log, if the account is unknown
     PasswordCheck pw = known
         ? CheckPassword(computer, bare.c_str(), _rgFieldStrings[TFI_PASSWORD], pwError)
         : PasswordCheck::Wrong;
@@ -607,8 +611,10 @@ IFACEMETHODIMP CTacCredential::ReportResult(NTSTATUS ntsStatus, NTSTATUS ntsSubs
     _ResetField(TFI_PASSWORD);
     _ResetField(TFI_OTP);
 
-    wchar_t text[96];
-    swprintf_s(text, L"Logon finished: status 0x%08lX, substatus 0x%08lX.",
+    // The name as it stands in the username field, cut to a sane length.
+    wchar_t text[192];
+    swprintf_s(text, L"Logon of '%.64s' finished: status 0x%08lX, substatus 0x%08lX.",
+               _rgFieldStrings[TFI_USERNAME] ? _rgFieldStrings[TFI_USERNAME] : L"",
                static_cast<unsigned long>(ntsStatus), static_cast<unsigned long>(ntsSubstatus));
     try
     {

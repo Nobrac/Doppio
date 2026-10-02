@@ -163,9 +163,9 @@ HRESULT CTacProvider::_CreateCredentials()
         return S_OK;
     }
 
-    // One tile per listed local user. A user that cannot be read is skipped,
-    // but an out-of-memory condition is reported to LogonUI
-    // instead of pretending the enumeration worked.
+    // One tile per listed local user. A user that cannot be read is skipped.
+    // Out of memory stops the loop; if not a single tile could be created,
+    // that is reported to LogonUI instead of pretending the enumeration worked.
     DWORD count = 0;
     if (_pUserArray && FAILED(_pUserArray->GetCount(&count)))
         count = 0;

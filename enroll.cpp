@@ -69,8 +69,8 @@ static int Unlock(const std::wstring& user, const std::wstring& sid)
     return 0;
 }
 
-// Removes an enrollment: the secret, the state and the name-keyed index the LSA
-// packages read. The account does not have to exist anymore. If it was already
+// Removes an enrollment: the secret, the state and the RID and name indexes the
+// LSA packages read. The account does not have to exist anymore. If it was already
 // deleted in Windows we cannot resolve a SID, but we can still drop the name
 // entry, and that is the one that would otherwise keep denying network logons.
 static int Remove(const std::wstring& user, const std::wstring& sid)
@@ -285,6 +285,8 @@ int wmain(int argc, wchar_t** argv)
     }
 
     wprintf(L"\nEnrolled '%s'. Test the logon now, before you import the filter.\n", user.c_str());
+    wprintf(L"Wait for the NEXT code in the app: the one you just typed is used up, and\n");
+    wprintf(L"typing it again at the logon screen counts as a wrong code.\n");
     wprintf(L"Clear this window afterwards (cls), the secret is still in the scrollback.\n");
     return 0;
 }
