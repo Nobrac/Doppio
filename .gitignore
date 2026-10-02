@@ -19,3 +19,6 @@ __pycache__/
 
 # Created by new-guids.ps1
 unregister-old.reg
+
+# Native test binary
+tests/native/test_verify

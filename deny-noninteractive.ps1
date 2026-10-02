@@ -2,13 +2,26 @@
 # the "Deny log on ..." user rights. No code in lsass, nothing that can crash,
 # and it survives reboots. On a real machine, this is the answer.
 #
-# Denied:   network (SMB), batch (scheduled tasks), service.
-# Allowed:  console logon and RDP - both show the 2FA tile from Part 1, so a
-#           second factor is actually possible there.
+# Denied:   network (SMB, WinRM), batch (scheduled tasks), service.
+# Allowed:  console logon, and RDP WITHOUT Network Level Authentication.
+#
+# RDP with NLA (the default) authenticates the user with a NETWORK logon
+# before the session starts. Denying network logon therefore also blocks RDP
+# with NLA for this account. You can:
+#   - use the console only, or
+#   - turn NLA off, so RDP goes straight to the logon screen with the 2FA tile
+#     (more pre-authentication attack surface on the RDP port), or
+#   - pass -KeepNetwork: RDP with NLA keeps working, but SMB/WinRM then still
+#     accept the password alone for this account.
+#
+# NOT covered by any user right: runas, the UAC credential prompt and programs
+# calling LogonUser interactively. Those are interactive logons that never show
+# the logon screen, so they still need only the password.
 #
 # Usage (elevated):
 #   .\deny-noninteractive.ps1 alice
-#   .\deny-noninteractive.ps1 alice -Remove      # undo
+#   .\deny-noninteractive.ps1 alice -KeepNetwork  # leave network logon alone
+#   .\deny-noninteractive.ps1 alice -Remove       # undo
 #
 # Enroll the account in the 2FA tile BEFORE you deny its other paths, and keep
 # a second admin account that still works. Otherwise a broken tile plus denied
@@ -16,7 +29,8 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$User,
-    [switch]$Remove
+    [switch]$Remove,
+    [switch]$KeepNetwork
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,13 +44,23 @@ try {
 }
 Write-Host "$env:COMPUTERNAME\$User -> $sid"
 
+# On a domain member, a GPO that sets the same rights replaces this local
+# setting at the next policy refresh, silently.
+if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
+    Write-Warning 'This computer is in a domain. A GPO that defines these user rights overwrites them at the next refresh. Set them in the GPO instead.'
+}
+
 # RemoteInteractive (SeDenyRemoteInteractiveLogonRight) is deliberately NOT in
 # this list. RDP shows the tile, so it keeps its second factor.
 $rights = @(
-    'SeDenyNetworkLogonRight',      # 3  - SMB and most remote access
+    'SeDenyNetworkLogonRight',      # 3  - SMB, WinRM, and the NLA step of RDP
     'SeDenyBatchLogonRight',        # 4  - scheduled tasks
     'SeDenyServiceLogonRight'       # 5  - service logons
 )
+# -Remove always cleans up all three, whatever was used when adding.
+if ($KeepNetwork -and -not $Remove) {
+    $rights = @($rights | Where-Object { $_ -ne 'SeDenyNetworkLogonRight' })
+}
 
 $work = Join-Path $env:TEMP 'tac-secpol'
 New-Item -ItemType Directory -Force $work | Out-Null
@@ -112,8 +136,15 @@ Write-Host ''
 if ($Remove) {
     Write-Host "Removed the deny rights for $User. Network, batch and service logon work again."
 } else {
-    Write-Host "Denied network, batch and service logon for $User."
-    Write-Host 'Console and RDP still work and still ask for the TOTP code.'
+    if ($KeepNetwork) {
+        Write-Host "Denied batch and service logon for $User. Network logon (SMB, WinRM) still"
+        Write-Host 'accepts the password alone. RDP with NLA keeps working and shows the 2FA tile.'
+    } else {
+        Write-Host "Denied network, batch and service logon for $User."
+        Write-Host 'The console still works and asks for the code. RDP works only with NLA'
+        Write-Host 'turned off, because NLA itself is a network logon.'
+    }
+    Write-Host 'runas and the UAC credential prompt are NOT covered and still take the password alone.'
 }
 Write-Host 'Takes effect at the next logon attempt - no reboot needed.'
 Write-Host "Check it with:  secedit /export /areas USER_RIGHTS /cfg con"
