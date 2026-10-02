@@ -11,6 +11,8 @@ namespace tac
 {
     static const wchar_t kKeyPath[]   = L"SOFTWARE\\TheAdminCafe\\2FA";
     static const wchar_t kStatePath[] = L"SOFTWARE\\TheAdminCafe\\2FA\\State";
+    // Name-keyed enrollment index for the LSA hot path (presence only, no secret).
+    static const wchar_t kNamePath[]  = L"SOFTWARE\\TheAdminCafe\\2FA\\Names";
 
     // SYSTEM and Administrators only. "P" blocks the inherited ACL of
     // HKLM\SOFTWARE, which would let every user read the key.
@@ -34,7 +36,6 @@ namespace tac
         DATA_BLOB out = {};
 
         // Machine scope, so LogonUI (SYSTEM) can decrypt what an admin encrypted.
-        // No UI may ever appear on the secure desktop.
         if (!CryptProtectData(&in, L"tac-2fa", nullptr, nullptr, nullptr,
                               CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN, &out))
             return false;
@@ -49,7 +50,6 @@ namespace tac
         DATA_BLOB in  = { static_cast<DWORD>(blob.size()), const_cast<BYTE*>(blob.data()) };
         DATA_BLOB out = {};
 
-        // The scope is stored in the blob, so no LOCAL_MACHINE flag here.
         if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr,
                                 CRYPTPROTECT_UI_FORBIDDEN, &out))
             return false;
@@ -102,6 +102,27 @@ namespace tac
         return sid.size() > 4 && sid.compare(0, 4, L"S-1-") == 0;
     }
 
+    // SID string -> normalized local account name. Used only at enroll time (a
+    // console app), never on the LSA hot path.
+    static bool NameFromSid(const std::wstring& sidStr, std::wstring& name)
+    {
+        name.clear();
+        PSID psid = nullptr;
+        if (!ConvertStringSidToSidW(sidStr.c_str(), &psid))
+            return false;
+
+        WCHAR n[256] = {}; DWORD cn = ARRAYSIZE(n);
+        WCHAR d[256] = {}; DWORD cd = ARRAYSIZE(d);
+        SID_NAME_USE use;
+        BOOL ok = LookupAccountSidW(nullptr, psid, n, &cn, d, &cd, &use);
+        LocalFree(psid);
+        if (!ok)
+            return false;
+
+        name = NormalizeUser(n);
+        return !name.empty();
+    }
+
     // Creates or opens a key below HKLM with our ACL. The security attributes
     // only apply when the key is created. An existing key might still carry a
     // weaker ACL, so it is set again.
@@ -148,7 +169,35 @@ namespace tac
                                     blob.data(), static_cast<DWORD>(blob.size()));
             RegCloseKey(hKey);
         }
-        return status == ERROR_SUCCESS;
+        if (status != ERROR_SUCCESS)
+            return false;
+
+        // Mirror the name-keyed index the LSA hot path reads. Enrollment is not
+        // complete without it, so a failure here rolls the secret back.
+        std::wstring name;
+        bool indexed = false;
+        if (NameFromSid(sid, name))
+        {
+            HKEY hN = nullptr;
+            if (OpenProtectedKey(kNamePath, &hN) == ERROR_SUCCESS)
+            {
+                DWORD one = 1;
+                indexed = RegSetValueExW(hN, name.c_str(), 0, REG_DWORD,
+                                         reinterpret_cast<const BYTE*>(&one), sizeof(one)) == ERROR_SUCCESS;
+                RegCloseKey(hN);
+            }
+        }
+        if (!indexed)
+        {
+            // Roll back the secret so enrollment stays all-or-nothing.
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKeyPath, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+            {
+                RegDeleteValueW(hKey, sid.c_str());
+                RegCloseKey(hKey);
+            }
+            return false;
+        }
+        return true;
     }
 
     bool LoadSecretKey(const std::wstring& sid, std::vector<BYTE>& key)
@@ -191,6 +240,24 @@ namespace tac
             return false;
         }
         return true;
+    }
+
+    bool IsEnrolledByName(const std::wstring& user)
+    {
+        std::wstring name = NormalizeUser(user);
+        if (name.empty())
+            return false;
+
+        // A single registry read. No DPAPI, no LookupAccount* - nothing that
+        // re-enters LSA - so this is safe to call from inside lsass on the
+        // logon path.
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kNamePath, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
+            return false;
+
+        LSTATUS status = RegQueryValueExW(hKey, name.c_str(), nullptr, nullptr, nullptr, nullptr);
+        RegCloseKey(hKey);
+        return status == ERROR_SUCCESS;
     }
 
     bool LoadState(const std::wstring& sid, UserState& state)

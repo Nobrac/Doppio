@@ -1,13 +1,12 @@
 @echo off
 REM =====================================================================
-REM  Build TacProvider.dll and enroll.exe in one shot.
+REM  Build TacProvider.dll, enroll.exe, and the LSA pieces in one shot.
 REM
 REM  Run this from the "x64 Native Tools Command Prompt" of your Visual
 REM  Studio / Build Tools version (Start menu -> Visual Studio folder). That shell puts
 REM  cl.exe and the Windows SDK on your PATH automatically.
 REM
 REM  Usage:   build.bat
-REM  Output:  TacProvider.dll  and  enroll.exe  in this folder.
 REM  /MT links the C++ runtime statically, so the target machine needs
 REM  no Visual C++ Redistributable.
 REM =====================================================================
@@ -34,12 +33,33 @@ cl /nologo /MT /EHsc /std:c++17 /W3 /DUNICODE /D_UNICODE ^
 if errorlevel 1 goto :fail
 
 echo.
+echo === Building TacAuthPackage.dll (LSA authentication package, SKELETON) ===
+echo     Runs in lsass.exe. Only load it in a throwaway VM with a snapshot.
+cl /nologo /LD /MT /EHsc /std:c++17 /W3 /DUNICODE /D_UNICODE ^
+   ap.cpp store.cpp totp.cpp ^
+   /Fe:TacAuthPackage.dll ^
+   /link /DEF:TacAuthPackage.def ^
+   advapi32.lib crypt32.lib bcrypt.lib
+if errorlevel 1 goto :fail
+
+echo.
+echo === Building TacSubAuth.dll (MSV1_0 sub-authentication package, SKELETON) ===
+echo     Runs in lsass.exe. Only load it in a throwaway VM with a snapshot.
+cl /nologo /LD /MT /EHsc /std:c++17 /W3 /DUNICODE /D_UNICODE ^
+   subauth.cpp store.cpp totp.cpp ^
+   /Fe:TacSubAuth.dll ^
+   /link /DEF:TacSubAuth.def ^
+   advapi32.lib crypt32.lib bcrypt.lib
+if errorlevel 1 goto :fail
+
+echo.
 echo === Done. Cleaning up intermediate files ===
 del /q *.obj *.exp 2>nul
 
 echo.
-echo Built: TacProvider.dll  and  enroll.exe
+echo Built: TacProvider.dll, enroll.exe, TacAuthPackage.dll, TacSubAuth.dll
 echo (TacProvider.lib is just the import library; you don't deploy it.)
+echo (The two LSA DLLs are SKELETONS that run in LSA - VM with snapshot only.)
 goto :eof
 
 :fail
