@@ -1,5 +1,6 @@
 #include "totp.h"
 #include "store.h"
+#include "statelock.h"
 #include <bcrypt.h>
 #include <conio.h>
 #include <cctype>
@@ -39,6 +40,13 @@ static std::string UrlEncode(const std::wstring& text)
 // unlock never makes an old code valid again.
 static int Unlock(const std::wstring& user, const std::wstring& sid)
 {
+    tac::StateLock lock;
+    if (!lock.Held())
+    {
+        wprintf(L"Could not take the state lock. Run this elevated, from the install folder.\n");
+        return 1;
+    }
+
     tac::UserState state;
     if (!tac::LoadState(sid, state))
     {
@@ -84,15 +92,74 @@ static int Remove(const std::wstring& user, const std::wstring& sid)
     return 0;
 }
 
+// Rebuilds the RID and name indexes the LSA packages read, from the stored
+// secrets. Needed once after updating from a version without the RID index,
+// and after renaming an enrolled account.
+static int Reindex()
+{
+    int count = tac::ReindexEnrollments();
+    if (count < 0)
+    {
+        wprintf(L"Could not read the enrollments or write the index. Run this from an elevated prompt.\n");
+        return 1;
+    }
+    wprintf(L"Indexed %d enrollment(s).\n", count);
+    return 0;
+}
+
+// Reads one line from the console, at most `max` characters.
+static std::wstring ReadLine(size_t max)
+{
+    wchar_t buf[64] = {};
+    if (!fgetws(buf, ARRAYSIZE(buf), stdin))
+        return std::wstring();
+    std::wstring line(buf);
+    SecureZeroMemory(buf, sizeof(buf));
+    while (!line.empty() && (line.back() == L'\n' || line.back() == L'\r' || line.back() == L' '))
+        line.pop_back();
+    if (line.size() > max)
+        line.clear();
+    return line;
+}
+
+// Asks for a code from the authenticator app before anything is stored. A
+// secret that was mistyped into the app would otherwise lock the account out
+// at the next logon. On success `step` is the time step of the code, so the
+// same code cannot be used again at the logon screen.
+static bool ConfirmSecret(const std::string& secret, uint64_t& step)
+{
+    std::vector<BYTE> key;
+    if (!tac::Base32Decode(secret, key))
+        return false;
+
+    bool ok = false;
+    for (int attempt = 1; attempt <= 3 && !ok; ++attempt)
+    {
+        wprintf(L"Enter the 6-digit code from your authenticator app (attempt %d of 3): ", attempt);
+        std::wstring code = ReadLine(16);
+        ok = tac::ValidateTotp(key, code, static_cast<uint64_t>(time(nullptr)), 0, step);
+        if (!code.empty())
+            SecureZeroMemory(&code[0], code.size() * sizeof(WCHAR));
+        if (!ok)
+            wprintf(L"That code does not match. Check the secret in the app and the clock of both devices.\n");
+    }
+    SecureZeroMemory(key.data(), key.size());
+    return ok;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 2 && _wcsicmp(argv[1], L"/reindex") == 0)
+        return Reindex();
+
     bool unlock = argc == 3 && _wcsicmp(argv[1], L"/unlock") == 0;
     bool remove = argc == 3 && _wcsicmp(argv[1], L"/remove") == 0;
-    if (argc != 2 && !unlock && !remove)
+    if ((argc != 2 && !unlock && !remove) || (argc == 2 && argv[1][0] == L'/'))
     {
         wprintf(L"Usage: enroll <local username>\n");
         wprintf(L"       enroll /unlock <local username>\n");
         wprintf(L"       enroll /remove <local username>\n");
+        wprintf(L"       enroll /reindex\n");
         return 1;
     }
 
@@ -141,36 +208,52 @@ int wmain(int argc, wchar_t** argv)
     std::string secret = tac::Base32Encode(raw, sizeof(raw));
     SecureZeroMemory(raw, sizeof(raw));
 
-    // A new secret starts with a clean state: no lock, no used time step.
-    // The two steps are reported separately, because "the secret is stored but
-    // the old state is still there" is a different situation from "nothing was
-    // written" and needs a different fix.
-    if (!tac::StoreSecret(sid, secret))
-    {
-        wprintf(L"Could not store the secret. Run this from an elevated prompt.\n");
-        SecureZeroMemory(&secret[0], secret.size());
-        return 1;
-    }
-    if (!tac::DeleteState(sid))
-    {
-        wprintf(L"The secret was stored, but the old lockout and replay state of '%s'\n", user.c_str());
-        wprintf(L"could not be cleared. Run 'enroll /unlock %s' from an elevated prompt.\n", user.c_str());
-        SecureZeroMemory(&secret[0], secret.size());
-        return 1;
-    }
-
     std::string uri = "otpauth://totp/TheAdminCafe:" + UrlEncode(user) +
                       "?secret=" + secret +
                       "&issuer=TheAdminCafe&algorithm=SHA1&digits=6&period=30";
 
-    wprintf(L"\nEnrolled '%s' (%s).\n\n", user.c_str(), sid.c_str());
+    // Show the secret first and store it only after a code from the app
+    // matches. Until then nothing is written, and an existing enrollment
+    // keeps working.
+    wprintf(L"\nNew secret for '%s' (%s):\n\n", user.c_str(), sid.c_str());
     wprintf(L"  Secret : %S\n", secret.c_str());
     wprintf(L"  URI    : %S\n\n", uri.c_str());
-    wprintf(L"Add the secret to your authenticator app, then test the logon.\n");
-    wprintf(L"Don't paste it into an online QR code generator. Clear this window\n");
-    wprintf(L"afterwards (cls), the secret is still in the scrollback.\n");
-
-    SecureZeroMemory(&secret[0], secret.size());
+    wprintf(L"Add the secret to your authenticator app. Don't paste it into an online\n");
+    wprintf(L"QR code generator.\n\n");
     SecureZeroMemory(&uri[0], uri.size());
+
+    uint64_t confirmedStep = 0;
+    if (!ConfirmSecret(secret, confirmedStep))
+    {
+        wprintf(L"\nNot enrolled: no matching code. Nothing was changed.\n");
+        SecureZeroMemory(&secret[0], secret.size());
+        return 1;
+    }
+
+    // A new secret starts with a clean state: no lock, and the confirmation
+    // code counts as used. The two steps are reported separately, because "the
+    // secret is stored but the old state is still there" is a different
+    // situation from "nothing was written" and needs a different fix.
+    if (!tac::StoreSecret(sid, secret))
+    {
+        wprintf(L"Could not store the secret. Run this from an elevated prompt.\n");
+        wprintf(L"An earlier enrollment of '%s', if any, is unchanged.\n", user.c_str());
+        SecureZeroMemory(&secret[0], secret.size());
+        return 1;
+    }
+    SecureZeroMemory(&secret[0], secret.size());
+
+    tac::UserState fresh = {};
+    fresh.lastStep = confirmedStep;
+    tac::StateLock lock;
+    if (!lock.Held() || !tac::SaveState(sid, fresh))
+    {
+        wprintf(L"The secret was stored, but the old lockout and replay state of '%s'\n", user.c_str());
+        wprintf(L"could not be reset. Run 'enroll /unlock %s' from an elevated prompt.\n", user.c_str());
+        return 1;
+    }
+
+    wprintf(L"\nEnrolled '%s'. Test the logon now, before you import the filter.\n", user.c_str());
+    wprintf(L"Clear this window afterwards (cls), the secret is still in the scrollback.\n");
     return 0;
 }

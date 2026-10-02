@@ -105,12 +105,18 @@ namespace
         return std::wstring(s, us.Length / sizeof(WCHAR));
     }
 
-    // The account check, now switched on. We read ONLY the user name from the
-    // submit buffer (never the password field) and ask the store, with a single
-    // registry read, whether that name is enrolled. IsEnrolledByName does no
-    // DPAPI and no LSA name/SID lookup, so it is safe on the logon path. Any
+    // The account check. We read ONLY the user name from the submit buffer
+    // (never the password field) and ask the store, with a single registry
+    // read, whether that name is enrolled. IsEnrolledByName does no DPAPI and
+    // no LSA name/SID lookup, so it is safe on the logon path. Any
     // inconsistency returns false (treat as not enrolled -> defer), so a
     // malformed buffer cannot crash us.
+    //
+    // The name is what the CLIENT typed, and the name index is not updated by
+    // a rename (see store.h), so this check is weaker than the RID check in
+    // the sub-authentication filter. It does not matter here - this package
+    // never lets a logon through either way (see ap.h) - but do not copy it
+    // into anything that does.
     bool IsEnrolledAccount(PVOID submit, ULONG size, PVOID clientBase)
     {
         if (!submit || size < sizeof(KERB_INTERACTIVE_LOGON))

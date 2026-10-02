@@ -9,6 +9,12 @@ add_compile_definitions(UNICODE _UNICODE)
 # Without this, LogonUI silently fails to load the DLL on a clean VM.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Control Flow Guard for everything: these binaries run in LogonUI and lsass.
+if(MSVC)
+    add_compile_options(/guard:cf)
+    add_link_options(/guard:cf)
+endif()
+
 # --- the credential provider + filter DLL ---
 add_library(TacProvider SHARED
     dll.cpp
@@ -19,6 +25,7 @@ add_library(TacProvider SHARED
     totp.cpp
     store.cpp
     verify.cpp
+    statelock.cpp
     eventlog.cpp)
 
 target_link_libraries(TacProvider PRIVATE
@@ -32,7 +39,8 @@ set_target_properties(TacProvider PROPERTIES
 add_executable(enroll
     enroll.cpp
     totp.cpp
-    store.cpp)
+    store.cpp
+    statelock.cpp)
 
 target_link_libraries(enroll PRIVATE
     bcrypt crypt32 advapi32)

@@ -34,7 +34,9 @@ namespace tac
         }
 
         // For RDP, add the client address. LogonUI runs in the session of the
-        // connection, so WTS_CURRENT_SESSION is the right one.
+        // connection, so WTS_CURRENT_SESSION is the right one. This is the
+        // address the RDP CLIENT reports about itself, not the address of the
+        // TCP connection, so it is a hint for the log and not evidence.
         std::wstring from = L"unknown address";
         WTS_CLIENT_ADDRESS* addr = nullptr;
         DWORD cb = 0;
@@ -59,7 +61,7 @@ namespace tac
         if (addr)
             WTSFreeMemory(addr);
 
-        swprintf_s(buf, L"remote from %s, session %lu", from.c_str(), sessionId);
+        swprintf_s(buf, L"remote, client reports %s, session %lu", from.c_str(), sessionId);
         return buf;
     }
 }

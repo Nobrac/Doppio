@@ -12,6 +12,14 @@
 // logon that reaches us. Interactive and unlock are left to the credential
 // provider, which already asks for the TOTP.
 //
+// Be clear about what that is worth: NOTHING as a security control. A logon
+// only reaches this package if the caller asks for it by package id, and every
+// such logon fails anyway - denied, or declined with STATUS_NOT_IMPLEMENTED,
+// because this package never builds a token. No real logon path is closed by
+// loading it. It is here to show the LSA package interface and the logging,
+// nothing more. The path that actually matters is the sub-authentication
+// filter (subauth.cpp) or, on a real machine, the user rights.
+//
 // WARNING: this code runs in lsass.exe. A bug here does not fail one tile - it
 // can crash LSA and leave the machine unbootable, past Safe Mode. Only ever
 // load it in a throwaway VM with a snapshot, and debug it over a kernel
