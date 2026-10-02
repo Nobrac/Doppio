@@ -45,7 +45,8 @@ namespace tac
             if (addr->AddressFamily == AF_INET)
             {
                 // For IPv4 the address starts at offset 2 of the byte array.
-                wchar_t ip[16];
+                // 16 would be exactly enough for "255.255.255.255"; leave room.
+                wchar_t ip[20];
                 swprintf_s(ip, L"%u.%u.%u.%u", addr->Address[2], addr->Address[3],
                            addr->Address[4], addr->Address[5]);
                 from = ip;

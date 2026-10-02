@@ -414,7 +414,11 @@ IFACEMETHODIMP CTacCredential::GetSerialization(
         hr = SplitDomainAndUsername(qualified.c_str(), domain, ARRAYSIZE(domain),
                                     user, ARRAYSIZE(user));
 
-    KERB_INTERACTIVE_UNLOCK_LOGON kiul;
+    // Zeroed here and not only inside KerbInteractiveUnlockLogonInit: every use
+    // below sits behind SUCCEEDED(hr), so today it can never be read uninitialised.
+    // One edit that moves a call out of that chain would hand Pack a stack full
+    // of garbage pointers, and this costs nothing.
+    KERB_INTERACTIVE_UNLOCK_LOGON kiul = {};
     if (SUCCEEDED(hr))
         hr = KerbInteractiveUnlockLogonInit(domain, user, pwzPassword, _cpus, &kiul);
     if (SUCCEEDED(hr))

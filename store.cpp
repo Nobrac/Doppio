@@ -260,6 +260,47 @@ namespace tac
         return status == ERROR_SUCCESS;
     }
 
+    // Deletes one value and treats "was not there" as done.
+    static bool DeleteValue(const wchar_t* path, const std::wstring& value)
+    {
+        HKEY hKey = nullptr;
+        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_SET_VALUE, &hKey);
+        if (status == ERROR_FILE_NOT_FOUND)
+            return true;
+        if (status != ERROR_SUCCESS)
+            return false;
+
+        status = RegDeleteValueW(hKey, value.c_str());
+        RegCloseKey(hKey);
+        return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
+    }
+
+    bool RemoveEnrollment(const std::wstring& user, const std::wstring& sid)
+    {
+        bool ok = true;
+
+        // The name-keyed index first. This is the one the LSA packages read, so
+        // if only one of the two halves can go, it should be this one.
+        std::wstring typed = NormalizeUser(user);
+        if (!typed.empty())
+            ok = DeleteValue(kNamePath, typed) && ok;
+
+        if (IsSidString(sid))
+        {
+            // StoreSecret keys the index by the name it got from NameFromSid,
+            // not by whatever was typed. Those are normally the same, but
+            // LookupAccountName accepts spellings the SAM does not store, so
+            // remove the canonical one as well. Deleting a value twice is free.
+            std::wstring canonical;
+            if (NameFromSid(sid, canonical) && !canonical.empty() && canonical != typed)
+                ok = DeleteValue(kNamePath, canonical) && ok;
+
+            ok = DeleteValue(kKeyPath, sid) && ok;
+            ok = DeleteValue(kStatePath, sid) && ok;
+        }
+        return ok;
+    }
+
     bool LoadState(const std::wstring& sid, UserState& state)
     {
         ZeroMemory(&state, sizeof(state));
@@ -310,16 +351,6 @@ namespace tac
     {
         if (!IsSidString(sid))
             return false;
-
-        HKEY hKey = nullptr;
-        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kStatePath, 0, KEY_SET_VALUE, &hKey);
-        if (status == ERROR_FILE_NOT_FOUND)
-            return true;
-        if (status != ERROR_SUCCESS)
-            return false;
-
-        status = RegDeleteValueW(hKey, sid.c_str());
-        RegCloseKey(hKey);
-        return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
+        return DeleteValue(kStatePath, sid);
     }
 }

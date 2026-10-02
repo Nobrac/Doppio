@@ -30,6 +30,16 @@ namespace tac
     // makes the LSA deny MORE restrictive (fail safe), never less.
     bool IsEnrolledByName(const std::wstring& user);
 
+    // Removes an enrollment completely: the DPAPI secret and the state under the
+    // SID, and the name-keyed index entry. Both halves are removed independently
+    // on purpose. The name entry is what the LSA packages read, so it has to go
+    // even when the Windows account was already deleted and the SID can no longer
+    // be resolved - otherwise that name stays "enrolled" forever and the LSA
+    // packages keep denying its network logons with nothing left to explain it.
+    // An empty user or sid simply skips that half. A value that is not there
+    // counts as removed.
+    bool RemoveEnrollment(const std::wstring& user, const std::wstring& sid);
+
     // Per-account state for replay protection and rate limiting.
     struct UserState
     {

@@ -44,3 +44,11 @@ static const FIELD_STATE_PAIR s_rgFieldStatePairs[] =
     { CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_NONE    },   // TFI_OTP
     { CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_NONE    },   // TFI_SUBMIT
 };
+
+// The provider reports TFI_NUM_FIELDS descriptors and LogonUI then asks for each
+// one by index. If the enum and these tables ever drift apart, that is a read
+// past the end of the array on the logon screen, so let the compiler check it.
+static_assert(ARRAYSIZE(s_rgFieldDescriptors) == TFI_NUM_FIELDS,
+              "s_rgFieldDescriptors must have one entry per TAC_FIELD_ID");
+static_assert(ARRAYSIZE(s_rgFieldStatePairs) == TFI_NUM_FIELDS,
+              "s_rgFieldStatePairs must have one entry per TAC_FIELD_ID");

@@ -61,28 +61,61 @@ static int Unlock(const std::wstring& user, const std::wstring& sid)
     return 0;
 }
 
+// Removes an enrollment: the secret, the state and the name-keyed index the LSA
+// packages read. The account does not have to exist anymore. If it was already
+// deleted in Windows we cannot resolve a SID, but we can still drop the name
+// entry, and that is the one that would otherwise keep denying network logons.
+static int Remove(const std::wstring& user, const std::wstring& sid)
+{
+    if (sid.empty())
+        wprintf(L"'%s' is not a local user account (anymore). Removing the name entry only.\n",
+                user.c_str());
+
+    if (!tac::RemoveEnrollment(user, sid))
+    {
+        wprintf(L"Could not remove the enrollment of '%s'. Run this from an elevated prompt.\n",
+                user.c_str());
+        return 1;
+    }
+
+    wprintf(L"Removed the enrollment of '%s'.\n", user.c_str());
+    wprintf(L"The account can log on with its password alone again, unless you also\n");
+    wprintf(L"set the deny rights (deny-noninteractive.ps1).\n");
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     bool unlock = argc == 3 && _wcsicmp(argv[1], L"/unlock") == 0;
-    if (argc != 2 && !unlock)
+    bool remove = argc == 3 && _wcsicmp(argv[1], L"/remove") == 0;
+    if (argc != 2 && !unlock && !remove)
     {
         wprintf(L"Usage: enroll <local username>\n");
         wprintf(L"       enroll /unlock <local username>\n");
+        wprintf(L"       enroll /remove <local username>\n");
         return 1;
     }
 
     // Only names that exist as a local user account on this machine. The
     // secret is stored under the SID of that account.
-    std::wstring user = tac::NormalizeUser(argv[unlock ? 2 : 1]);
+    std::wstring user = tac::NormalizeUser(argv[(unlock || remove) ? 2 : 1]);
     std::wstring sid;
     if (!tac::ResolveLocalUserSid(user, sid))
     {
-        wprintf(L"'%s' is not a local user account on this machine.\n", user.c_str());
-        return 1;
+        // For /remove an unresolvable name is not fatal: the name-keyed index
+        // entry can and should still go. Everything else needs the SID.
+        if (!remove)
+        {
+            wprintf(L"'%s' is not a local user account on this machine.\n", user.c_str());
+            return 1;
+        }
+        sid.clear();
     }
 
     if (unlock)
         return Unlock(user, sid);
+    if (remove)
+        return Remove(user, sid);
 
     std::vector<BYTE> existing;
     if (tac::LoadSecretKey(sid, existing))
@@ -109,9 +142,19 @@ int wmain(int argc, wchar_t** argv)
     SecureZeroMemory(raw, sizeof(raw));
 
     // A new secret starts with a clean state: no lock, no used time step.
-    if (!tac::StoreSecret(sid, secret) || !tac::DeleteState(sid))
+    // The two steps are reported separately, because "the secret is stored but
+    // the old state is still there" is a different situation from "nothing was
+    // written" and needs a different fix.
+    if (!tac::StoreSecret(sid, secret))
     {
         wprintf(L"Could not store the secret. Run this from an elevated prompt.\n");
+        SecureZeroMemory(&secret[0], secret.size());
+        return 1;
+    }
+    if (!tac::DeleteState(sid))
+    {
+        wprintf(L"The secret was stored, but the old lockout and replay state of '%s'\n", user.c_str());
+        wprintf(L"could not be cleared. Run 'enroll /unlock %s' from an elevated prompt.\n", user.c_str());
         SecureZeroMemory(&secret[0], secret.size());
         return 1;
     }

@@ -43,6 +43,10 @@ reg import .\register-filter.reg
 ```
 
 Unlock a user after too many wrong codes: `enroll.exe /unlock alice`.
+Remove an enrollment again: `enroll.exe /remove alice`. That drops the secret,
+the state and the name entry the LSA packages read. Use it before you delete the
+Windows account, or that name keeps being treated as enrolled - `/remove` still
+cleans it up afterwards, but only if you remember the name.
 Uninstall: `reg import .\unregister.reg`, reboot, delete the folder.
 
 ## Closing the non-interactive paths
