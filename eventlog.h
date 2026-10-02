@@ -14,12 +14,14 @@ namespace tac
         EVT_LOCK_STARTED  = 104,   // this attempt locked the account
         EVT_NOT_ENROLLED  = 105,
         EVT_ERROR         = 106,
+        EVT_PASSWORD_BAD  = 107,   // password refused before the code was checked
     };
 
     // Writes one line of text. Never throws, never shows UI. If the event log
     // is not reachable, the event is lost and the logon goes on.
     void LogEvent(WORD type, DWORD id, const std::wstring& text);
 
-    // "console, session 1" or "remote from 192.168.1.50, session 3".
+    // "console, session 1" or "remote, client reports 192.168.1.50, session 3".
+    // The remote address is self-reported by the RDP client.
     std::wstring DescribeSession();
 }

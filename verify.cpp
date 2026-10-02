@@ -1,6 +1,7 @@
 #include "verify.h"
 #include "store.h"
 #include "totp.h"
+#include "statelock.h"
 #include <vector>
 
 namespace tac
@@ -26,6 +27,13 @@ namespace tac
                         uint64_t now, OtpInfo& info)
     {
         info = {};
+
+        // Load, check and save as one step. Two logon screens checking the same
+        // account at the same moment would otherwise both accept one code.
+        // No lock, no check: fail closed.
+        StateLock lock;
+        if (!lock.Held())
+            return OtpResult::Error;
 
         std::vector<BYTE> key;
         if (!LoadSecretKey(sid, key))

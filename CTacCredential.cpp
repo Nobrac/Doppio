@@ -297,7 +297,54 @@ IFACEMETHODIMP CTacCredential::GetUserSid(PWSTR* ppszSid)
     return SHStrDupW(_pszSid, ppszSid);
 }
 
-// --- the actual work: check the code, then serialize the password -----------
+// --- the actual work: password, then code, then serialize -------------------
+
+enum class PasswordCheck { Ok, Wrong, Refused };
+
+// Asks Windows whether the password is right, before the code is looked at.
+//
+// The order matters. Every wrong code counts toward the lock, so if the code
+// came first, anyone at the logon screen - or anyone with any RDP account,
+// since the RDP tile lets you type another name - could lock every enrolled
+// account out without knowing a single password. Checking the password first
+// means only someone who already has factor one can burn guesses on factor
+// two. Wrong passwords are counted by Windows itself (account lockout policy),
+// exactly as on the built-in tile.
+//
+// LogonUser with LOGON32_LOGON_INTERACTIVE is used because the deny rights and
+// the sub-authentication filter of this project block network logons for
+// enrolled accounts. The token is closed right away; the side effect is one
+// extra logon event (4624, type 2, process LogonUI.exe) per sign-in.
+static PasswordCheck CheckPassword(PCWSTR domain, PCWSTR user, PCWSTR password, DWORD& error)
+{
+    error = ERROR_SUCCESS;
+    HANDLE token = nullptr;
+    if (LogonUserW(user, domain, password ? password : L"", LOGON32_LOGON_INTERACTIVE,
+                   LOGON32_PROVIDER_DEFAULT, &token))
+    {
+        CloseHandle(token);
+        return PasswordCheck::Ok;
+    }
+
+    error = GetLastError();
+    switch (error)
+    {
+    // These are only reported after the password was accepted. The real logon
+    // below runs into the same condition and Windows handles it there (for
+    // example "Allow log on locally" missing for an RDP-only user on a server).
+    case ERROR_LOGON_TYPE_NOT_GRANTED:
+    case ERROR_PASSWORD_MUST_CHANGE:
+    case ERROR_PASSWORD_EXPIRED:
+        return PasswordCheck::Ok;
+
+    case ERROR_LOGON_FAILURE:
+        return PasswordCheck::Wrong;
+
+    default:   // locked out, disabled, blank password not allowed, ...
+        return PasswordCheck::Refused;
+    }
+}
+
 
 IFACEMETHODIMP CTacCredential::GetSerialization(
     CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE* pcpgsr,
@@ -321,27 +368,59 @@ IFACEMETHODIMP CTacCredential::GetSerialization(
     // The secret belongs to a SID. We resolve COMPUTERNAME\name exactly like
     // LSA will. On a user tile the result has to be the SID of the tile.
     std::wstring sid;
-    bool known = tac::ResolveLocalUserSid(bare, sid);
+    bool known = bare.size() <= 256 && tac::ResolveLocalUserSid(bare, sid);
     if (known && _pszSid && _wcsicmp(sid.c_str(), _pszSid) != 0)
         known = false;
 
-    const std::wstring who     = bare + L" (" + (known ? sid : std::wstring(L"unknown account")) + L")";
+    // Typed names end up in the event log; keep a long one from flooding it.
+    const std::wstring shown   = bare.size() > 64 ? bare.substr(0, 64) + L"..." : bare;
+    const std::wstring who     = shown + L" (" + (known ? sid : std::wstring(L"unknown account")) + L")";
     const std::wstring session = tac::DescribeSession();
+
+    WCHAR computer[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD cchComputer = ARRAYSIZE(computer);
+    if (!GetComputerNameW(computer, &cchComputer))
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    // --- the first factor: is the password right? ---
+    DWORD pwError = ERROR_SUCCESS;
+    PasswordCheck pw = known
+        ? CheckPassword(computer, bare.c_str(), _rgFieldStrings[TFI_PASSWORD], pwError)
+        : PasswordCheck::Wrong;
+
+    if (pw != PasswordCheck::Ok)
+    {
+        // The code was not looked at and nothing was counted. An unknown
+        // account gets the same message as a wrong password.
+        tac::LogEvent(EVENTLOG_WARNING_TYPE, tac::EVT_PASSWORD_BAD,
+                      L"Password refused for " + who + L" (error " + std::to_wstring(pwError) +
+                          L"). The one-time code was not checked. " + session + L".");
+
+        PCWSTR message = L"The user name or password is incorrect.";
+        if (pw == PasswordCheck::Refused)
+            message = (pwError == ERROR_ACCOUNT_LOCKED_OUT)
+                ? L"This account is locked by Windows. Try again later."
+                : L"Windows refused the logon for this account.";
+
+        _ResetField(TFI_PASSWORD);
+        _ResetField(TFI_OTP);
+        SHStrDupW(message, ppwszOptionalStatusText);
+        *pcpsiOptionalStatusIcon = CPSI_ERROR;
+        return S_OK;   // S_OK keeps the tile alive; a failing HRESULT would kill it
+    }
 
     // --- the second factor ---
     std::wstring code = _rgFieldStrings[TFI_OTP] ? _rgFieldStrings[TFI_OTP] : L"";
     tac::OtpInfo info = {};
-    tac::OtpResult result = known
-        ? tac::VerifyOtp(sid, code, static_cast<uint64_t>(time(nullptr)), info)
-        : tac::OtpResult::NotEnrolled;
+    tac::OtpResult result = tac::VerifyOtp(sid, code, static_cast<uint64_t>(time(nullptr)), info);
     if (!code.empty())
         SecureZeroMemory(&code[0], code.size() * sizeof(WCHAR));
 
     if (result != tac::OtpResult::Ok)
     {
-        // "Not enrolled", "wrong" and "already used" look the same on screen,
-        // so the screen never reveals who is enrolled. Only the lock gets its
-        // own message, otherwise a locked user would keep typing valid codes.
+        // "Not enrolled", "wrong" and "already used" look the same on screen.
+        // Only the lock gets its own message, otherwise a locked user would
+        // keep typing valid codes.
         PCWSTR message = L"Invalid one-time code.";
         wchar_t lockText[128];
 
@@ -353,8 +432,8 @@ IFACEMETHODIMP CTacCredential::GetSerialization(
                           result == tac::OtpResult::Wrong ? tac::EVT_CODE_WRONG : tac::EVT_CODE_REPLAYED,
                           (result == tac::OtpResult::Wrong ? L"Wrong one-time code for "
                                                            : L"Already used one-time code for ") +
-                              who + L". Wrong codes in a row: " + std::to_wstring(info.failures) +
-                              L". " + session + L".");
+                              who + L" (password was correct). Wrong codes in a row: " +
+                              std::to_wstring(info.failures) + L". " + session + L".");
             if (info.minutesLeft)
             {
                 tac::LogEvent(EVENTLOG_ERROR_TYPE, tac::EVT_LOCK_STARTED,
@@ -381,31 +460,28 @@ IFACEMETHODIMP CTacCredential::GetSerialization(
 
         default:
             tac::LogEvent(EVENTLOG_ERROR_TYPE, tac::EVT_ERROR,
-                          L"Could not read or write the 2FA state of " + who +
+                          L"Could not lock, read or write the 2FA state of " + who +
                               L". The logon was refused. " + session + L".");
             break;
         }
 
+        // The password is proven, keep it; only the code has to be typed again.
+        _ResetField(TFI_OTP);
         SHStrDupW(message, ppwszOptionalStatusText);
         *pcpsiOptionalStatusIcon = CPSI_ERROR;
-        return S_OK;   // S_OK keeps the tile alive; a failing HRESULT would kill it
+        return S_OK;
     }
 
     tac::LogEvent(EVENTLOG_INFORMATION_TYPE, tac::EVT_CODE_OK,
                   L"Valid one-time code for " + who + L" (time step " + std::to_wstring(info.step) +
                       L"). The password goes to LSA now. " + session + L".");
 
-    // --- the ordinary password logon, once the code is valid ---
+    // --- the ordinary password logon, once both factors are valid ---
     PWSTR pwzPassword = nullptr;
     HRESULT hr = ProtectIfNecessaryAndCopyPassword(_rgFieldStrings[TFI_PASSWORD], _cpus, &pwzPassword);
 
     // Always log on as COMPUTERNAME\user. This is a local-account demo, so we
     // never authenticate a domain the user might have typed.
-    WCHAR computer[MAX_COMPUTERNAME_LENGTH + 1] = {};
-    DWORD cchComputer = ARRAYSIZE(computer);
-    if (SUCCEEDED(hr) && !GetComputerNameW(computer, &cchComputer))
-        hr = HRESULT_FROM_WIN32(GetLastError());
-
     std::wstring qualified = std::wstring(computer) + L"\\" + bare;
 
     WCHAR domain[64] = {};
@@ -451,8 +527,9 @@ IFACEMETHODIMP CTacCredential::GetSerialization(
 }
 
 // LSA reports the result of the logon here. If it failed, clear password and
-// code like the built-in tile does (the code is used up anyway), and turn a
-// wrong password into a readable message.
+// code like the built-in tile does (the code is used up anyway). The password
+// was already checked before the code, so a failure here is rare (the password
+// was changed in between, or a logon right is missing).
 IFACEMETHODIMP CTacCredential::ReportResult(NTSTATUS ntsStatus, NTSTATUS,
                                             PWSTR* ppwszOptionalStatusText,
                                             CREDENTIAL_PROVIDER_STATUS_ICON* pcpsiOptionalStatusIcon)

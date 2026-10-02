@@ -30,7 +30,13 @@ namespace tac
     uint32_t LockMinutesFor(uint32_t failures);
 
     // Checks the code for the account and updates its state (replay
-    // protection and rate limiting). `now` is the unix time.
+    // protection and rate limiting). `now` is the unix time. Holds the
+    // StateLock for the whole load-check-save; if it cannot be taken, the
+    // result is Error.
+    //
+    // Call this only AFTER the password was verified: every wrong code counts
+    // toward the lock, so checking codes for a password nobody has proven would
+    // let anyone at the logon screen lock any enrolled account out.
     OtpResult VerifyOtp(const std::wstring& sid, const std::wstring& code,
                         uint64_t now, OtpInfo& info);
 }
