@@ -1,4 +1,4 @@
-# Removes the Doppio MSV1_0 sub-authentication package. Run elevated, reboot after.
+# Removes the Doppio MSV1_0 sub-authentication filter. Run elevated, reboot after.
 $ErrorActionPreference = 'Stop'
 $dll = 'TacSubAuth'
 $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'
@@ -6,7 +6,8 @@ $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'
 $props = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 $removed = $false
 if ($props) {
-    1..4 | ForEach-Object {
+    # Auth0 is the filter; Auth1..Auth4 are left over from older versions.
+    0..4 | ForEach-Object {
         if ($props."Auth$_" -eq $dll) {
             Remove-ItemProperty -Path $key -Name "Auth$_"
             Write-Host "Removed sub-auth registration Auth$_."

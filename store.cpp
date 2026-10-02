@@ -3,6 +3,7 @@
 #include <wincrypt.h>
 #include <sddl.h>
 #include <cwctype>
+#include <cstdio>
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -11,8 +12,9 @@ namespace tac
 {
     static const wchar_t kKeyPath[]   = L"SOFTWARE\\TheAdminCafe\\2FA";
     static const wchar_t kStatePath[] = L"SOFTWARE\\TheAdminCafe\\2FA\\State";
-    // Name-keyed enrollment index for the LSA hot path (presence only, no secret).
+    // Enrollment indexes for the LSA hot path (presence only, no secret).
     static const wchar_t kNamePath[]  = L"SOFTWARE\\TheAdminCafe\\2FA\\Names";
+    static const wchar_t kRidPath[]   = L"SOFTWARE\\TheAdminCafe\\2FA\\Rids";
 
     // SYSTEM and Administrators only. "P" blocks the inherited ACL of
     // HKLM\SOFTWARE, which would let every user read the key.
@@ -102,6 +104,28 @@ namespace tac
         return sid.size() > 4 && sid.compare(0, 4, L"S-1-") == 0;
     }
 
+    bool RidFromSidString(const std::wstring& sid, DWORD& rid)
+    {
+        rid = 0;
+        if (!IsSidString(sid))
+            return false;
+        size_t dash = sid.find_last_of(L'-');
+        if (dash == std::wstring::npos || dash + 1 >= sid.size() || sid.size() - dash - 1 > 10)
+            return false;
+
+        uint64_t value = 0;
+        for (size_t i = dash + 1; i < sid.size(); ++i)
+        {
+            if (sid[i] < L'0' || sid[i] > L'9')
+                return false;
+            value = value * 10 + static_cast<uint64_t>(sid[i] - L'0');
+        }
+        if (value == 0 || value > 0xFFFFFFFFull)
+            return false;
+        rid = static_cast<DWORD>(value);
+        return true;
+    }
+
     // SID string -> normalized local account name. Used only at enroll time (a
     // console app), never on the LSA hot path.
     static bool NameFromSid(const std::wstring& sidStr, std::wstring& name)
@@ -152,6 +176,49 @@ namespace tac
         return status;
     }
 
+    // Deletes one value and treats "was not there" as done.
+    static bool DeleteValue(const wchar_t* path, const std::wstring& value)
+    {
+        HKEY hKey = nullptr;
+        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_SET_VALUE, &hKey);
+        if (status == ERROR_FILE_NOT_FOUND)
+            return true;
+        if (status != ERROR_SUCCESS)
+            return false;
+
+        status = RegDeleteValueW(hKey, value.c_str());
+        RegCloseKey(hKey);
+        return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
+    }
+
+    // Writes a presence flag (REG_DWORD 1) under one of the index keys.
+    static bool SetFlag(const wchar_t* path, const std::wstring& value)
+    {
+        HKEY hKey = nullptr;
+        if (OpenProtectedKey(path, &hKey) != ERROR_SUCCESS)
+            return false;
+        DWORD one = 1;
+        bool ok = RegSetValueExW(hKey, value.c_str(), 0, REG_DWORD,
+                                 reinterpret_cast<const BYTE*>(&one), sizeof(one)) == ERROR_SUCCESS;
+        RegCloseKey(hKey);
+        return ok;
+    }
+
+    // Writes the RID index and, if the SID still resolves to a name, the name
+    // index for one enrolled SID.
+    static void WriteIndexes(const std::wstring& sid, bool& ridOk, bool& nameOk)
+    {
+        ridOk = nameOk = false;
+
+        DWORD rid = 0;
+        if (RidFromSidString(sid, rid))
+            ridOk = SetFlag(kRidPath, std::to_wstring(rid));
+
+        std::wstring name;
+        if (NameFromSid(sid, name))
+            nameOk = SetFlag(kNamePath, name);
+    }
+
     bool StoreSecret(const std::wstring& sid, const std::string& base32Secret)
     {
         if (!IsSidString(sid))
@@ -159,6 +226,17 @@ namespace tac
 
         std::vector<BYTE> blob;
         if (!Protect(base32Secret, blob))
+            return false;
+
+        // The indexes the LSA hot path reads come first. If they cannot be
+        // written, nothing else is touched, so a re-enrollment that fails
+        // leaves the old enrollment working. If the secret then fails, the
+        // index entries stay behind: that only makes the LSA packages refuse
+        // MORE (network logon of an account without a secret), never less,
+        // and `enroll /remove` clears them.
+        bool ridOk = false, nameOk = false;
+        WriteIndexes(sid, ridOk, nameOk);
+        if (!ridOk || !nameOk)
             return false;
 
         HKEY hKey = nullptr;
@@ -169,35 +247,7 @@ namespace tac
                                     blob.data(), static_cast<DWORD>(blob.size()));
             RegCloseKey(hKey);
         }
-        if (status != ERROR_SUCCESS)
-            return false;
-
-        // Mirror the name-keyed index the LSA hot path reads. Enrollment is not
-        // complete without it, so a failure here rolls the secret back.
-        std::wstring name;
-        bool indexed = false;
-        if (NameFromSid(sid, name))
-        {
-            HKEY hN = nullptr;
-            if (OpenProtectedKey(kNamePath, &hN) == ERROR_SUCCESS)
-            {
-                DWORD one = 1;
-                indexed = RegSetValueExW(hN, name.c_str(), 0, REG_DWORD,
-                                         reinterpret_cast<const BYTE*>(&one), sizeof(one)) == ERROR_SUCCESS;
-                RegCloseKey(hN);
-            }
-        }
-        if (!indexed)
-        {
-            // Roll back the secret so enrollment stays all-or-nothing.
-            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKeyPath, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
-            {
-                RegDeleteValueW(hKey, sid.c_str());
-                RegCloseKey(hKey);
-            }
-            return false;
-        }
-        return true;
+        return status == ERROR_SUCCESS;
     }
 
     bool LoadSecretKey(const std::wstring& sid, std::vector<BYTE>& key)
@@ -242,6 +292,23 @@ namespace tac
         return true;
     }
 
+    bool IsEnrolledByRid(DWORD rid)
+    {
+        if (rid == 0)
+            return false;
+
+        // A single registry read, like IsEnrolledByName below.
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRidPath, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
+            return false;
+
+        WCHAR value[16];
+        swprintf_s(value, L"%lu", static_cast<unsigned long>(rid));
+        LSTATUS status = RegQueryValueExW(hKey, value, nullptr, nullptr, nullptr, nullptr);
+        RegCloseKey(hKey);
+        return status == ERROR_SUCCESS;
+    }
+
     bool IsEnrolledByName(const std::wstring& user)
     {
         std::wstring name = NormalizeUser(user);
@@ -260,27 +327,13 @@ namespace tac
         return status == ERROR_SUCCESS;
     }
 
-    // Deletes one value and treats "was not there" as done.
-    static bool DeleteValue(const wchar_t* path, const std::wstring& value)
-    {
-        HKEY hKey = nullptr;
-        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_SET_VALUE, &hKey);
-        if (status == ERROR_FILE_NOT_FOUND)
-            return true;
-        if (status != ERROR_SUCCESS)
-            return false;
-
-        status = RegDeleteValueW(hKey, value.c_str());
-        RegCloseKey(hKey);
-        return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
-    }
-
     bool RemoveEnrollment(const std::wstring& user, const std::wstring& sid)
     {
         bool ok = true;
 
-        // The name-keyed index first. This is the one the LSA packages read, so
-        // if only one of the two halves can go, it should be this one.
+        // The name-keyed index first: it is the half that can still be found
+        // when the account no longer exists. The RID entry of a deleted
+        // account is harmless, the SAM never hands that RID out again.
         std::wstring typed = NormalizeUser(user);
         if (!typed.empty())
             ok = DeleteValue(kNamePath, typed) && ok;
@@ -295,10 +348,61 @@ namespace tac
             if (NameFromSid(sid, canonical) && !canonical.empty() && canonical != typed)
                 ok = DeleteValue(kNamePath, canonical) && ok;
 
+            DWORD rid = 0;
+            if (RidFromSidString(sid, rid))
+                ok = DeleteValue(kRidPath, std::to_wstring(rid)) && ok;
+
             ok = DeleteValue(kKeyPath, sid) && ok;
             ok = DeleteValue(kStatePath, sid) && ok;
         }
         return ok;
+    }
+
+    int ReindexEnrollments()
+    {
+        HKEY hKey = nullptr;
+        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKeyPath, 0, KEY_QUERY_VALUE, &hKey);
+        if (status == ERROR_FILE_NOT_FOUND)
+            return 0;                           // nothing enrolled yet
+        if (status != ERROR_SUCCESS)
+            return -1;
+
+        // Collect first, write afterwards: the index keys are subkeys of this
+        // one, and enumerating while writing elsewhere is simpler to reason about.
+        std::vector<std::wstring> sids;
+        for (DWORD i = 0;; ++i)
+        {
+            WCHAR name[256];
+            DWORD cch = ARRAYSIZE(name);
+            DWORD type = 0;
+            status = RegEnumValueW(hKey, i, name, &cch, nullptr, &type, nullptr, nullptr);
+            if (status == ERROR_NO_MORE_ITEMS)
+                break;
+            if (status == ERROR_MORE_DATA)
+                continue;                       // not one of ours, SIDs are short
+            if (status != ERROR_SUCCESS)
+            {
+                RegCloseKey(hKey);
+                return -1;
+            }
+            if (type == REG_BINARY && IsSidString(name))
+                sids.emplace_back(name, cch);
+        }
+        RegCloseKey(hKey);
+
+        // The RID index is what the sub-authentication filter reads, so a
+        // failure there is an error. A missing name is not: the account may
+        // have been deleted, and then there is no name to index.
+        int count = 0;
+        for (const std::wstring& sid : sids)
+        {
+            bool ridOk = false, nameOk = false;
+            WriteIndexes(sid, ridOk, nameOk);
+            if (!ridOk)
+                return -1;
+            ++count;
+        }
+        return count;
     }
 
     bool LoadState(const std::wstring& sid, UserState& state)

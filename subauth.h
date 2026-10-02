@@ -1,28 +1,37 @@
 #pragma once
 //
-// Doppio MSV1_0 sub-authentication package (SKELETON).
+// Doppio MSV1_0 sub-authentication FILTER (SKELETON).
 //
-// A sub-authentication package is called by MSV1_0 *during* its own logon
-// processing. Unlike a top-level authentication package, it does not have to
-// build a token or validate the password itself: MSV1_0 does all of that. The
-// sub-auth routine only returns a decision - approve (STATUS_SUCCESS) or refuse
-// (a failure status) - and MSV1_0 acts on it. That is why this is the right
-// place to add a factor: MSV1_0 owns the credentials and the token, we only
-// veto.
+// MSV1_0 has two sub-authentication hooks, and they are very different:
 //
-// This is also the layer that actually sees MSV1_0's network logons, which a
-// top-level package addressed only to itself does not.
+//   Msv1_0SubAuthenticationRoutine (Auth1..AuthN)
+//       Called only for logons whose request explicitly selects package N in
+//       ParameterControl - ordinary SMB/NTLM logons never do. And when it IS
+//       called, authentication is its job: MSV1_0 hands it the challenge
+//       response and the SAM hashes and trusts its answer. Returning
+//       STATUS_SUCCESS there approves the logon without any password check.
+//       That is the wrong seam for a veto, and this project no longer uses it.
+//
+//   Msv1_0SubAuthenticationFilter (Auth0)
+//       Called AFTER MSV1_0 has validated the logon, as an additional check.
+//       STATUS_SUCCESS means "no objection, proceed", a failure status vetoes.
+//       MSV1_0 keeps the password check, the account restrictions and the
+//       token. This is the seam a second-factor veto belongs in.
 //
 // Policy of this skeleton: refuse a NETWORK logon for an enrolled account (no UI
-// to type a code there), and approve everything else so MSV1_0 finishes the
-// logon normally.
+// to type a code there), and raise no objection to anything else.
+//
+// The account is identified by the RID that MSV1_0 read from the SAM
+// (USER_ALL_INFORMATION::UserId), not by the name the client sent. The RID
+// survives a rename and cannot be spelled differently.
 //
 // It is registered under:
 //   HKLM\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0
-//     Auth<N> (REG_SZ) = TacSubAuth
-// and MSV1_0 calls it for logons that select sub-auth package <N>. See the
-// article chapter "2FA inside LSA" for exactly what that does and does not
-// cover, and for the credential-safety line this code holds.
+//     Auth0 (REG_SZ) = TacSubAuth
+// Microsoft documents Auth0 for the domain controller's registry. Whether the
+// filter also runs for local SAM accounts on a workstation is exactly what to
+// verify in the test VM: every call writes a [Doppio-SubAuth] OutputDebugString
+// line, readable under the kernel debugger.
 //
 // WARNING: runs in lsass.exe. A bug can leave the machine unbootable. Throwaway
 // VM, snapshot, kernel debugger only.
@@ -35,7 +44,7 @@
 
 extern "C"
 {
-    NTSTATUS NTAPI Msv1_0SubAuthenticationRoutine(
+    NTSTATUS NTAPI Msv1_0SubAuthenticationFilter(
         NETLOGON_LOGON_INFO_CLASS LogonLevel,
         PVOID LogonInformation,
         ULONG Flags,
