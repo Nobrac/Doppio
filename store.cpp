@@ -292,21 +292,56 @@ namespace tac
         return true;
     }
 
-    bool IsEnrolledByRid(DWORD rid)
+    // The RID as the decimal value name of the Rids index, without the CRT.
+    // This runs inside lsass, where swprintf_s on an overflow would end the
+    // process. A DWORD has at most 10 digits, so out[12] always fits.
+    static void RidToValueName(DWORD rid, WCHAR (&out)[12])
+    {
+        WCHAR digits[10];
+        int n = 0;
+        do
+        {
+            digits[n++] = static_cast<WCHAR>(L'0' + rid % 10);
+            rid /= 10;
+        } while (rid != 0 && n < 10);
+
+        int i = 0;
+        while (n > 0)
+            out[i++] = digits[--n];
+        out[i] = L'\0';                   // i <= 10, so this is in bounds
+    }
+
+    Enrollment EnrollmentByRid(DWORD rid)
     {
         if (rid == 0)
-            return false;
+            return Enrollment::No;
 
-        // A single registry read, like IsEnrolledByName below.
+        // A single registry read, like IsEnrolledByName below. Only a value
+        // that is really not there counts as "not enrolled". Any other failure
+        // is Unknown: a filter that read it as "not enrolled" would wave an
+        // enrolled account through on one unexpected error.
         HKEY hKey = nullptr;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRidPath, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
-            return false;
+        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRidPath, 0, KEY_QUERY_VALUE, &hKey);
+        if (status == ERROR_FILE_NOT_FOUND)
+            return Enrollment::No;        // no index on this machine at all
+        if (status != ERROR_SUCCESS)
+            return Enrollment::Unknown;
 
-        WCHAR value[16];
-        swprintf_s(value, L"%lu", static_cast<unsigned long>(rid));
-        LSTATUS status = RegQueryValueExW(hKey, value, nullptr, nullptr, nullptr, nullptr);
+        WCHAR value[12];
+        RidToValueName(rid, value);
+        status = RegQueryValueExW(hKey, value, nullptr, nullptr, nullptr, nullptr);
         RegCloseKey(hKey);
-        return status == ERROR_SUCCESS;
+
+        if (status == ERROR_SUCCESS)
+            return Enrollment::Yes;
+        if (status == ERROR_FILE_NOT_FOUND)
+            return Enrollment::No;
+        return Enrollment::Unknown;
+    }
+
+    bool IsEnrolledByRid(DWORD rid)
+    {
+        return EnrollmentByRid(rid) == Enrollment::Yes;
     }
 
     bool IsEnrolledByName(const std::wstring& user)

@@ -33,6 +33,13 @@ namespace tac
     // USER_ALL_INFORMATION). A RID survives a rename and the SAM never hands
     // out a RID twice, so this index can neither miss a renamed account nor
     // match a different, re-created one.
+    //
+    // EnrollmentByRid is the same read with three outcomes, for callers that
+    // VETO: a read that fails is Unknown, not "not enrolled". A missing Rids
+    // key is No (nothing indexed on this machine). IsEnrolledByRid is
+    // EnrollmentByRid(rid) == Yes, so it reads every failure as "not enrolled".
+    enum class Enrollment { No, Yes, Unknown };
+    Enrollment EnrollmentByRid(DWORD rid);
     bool IsEnrolledByRid(DWORD rid);
 
     // IsEnrolledByName is only for callers that have nothing but the name a
