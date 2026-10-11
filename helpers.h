@@ -4,7 +4,7 @@
 #include <ntsecapi.h>
 
 // Trimmed versions of the helpers from Microsoft's credential provider sample
-// (Windows-classic-samples, Security/CredentialProvider).
+// (Windows-classic-samples, Samples/CredentialProvider).
 
 HRESULT SplitDomainAndUsername(PCWSTR pszQualifiedUserName,
                                PWSTR pszDomain, int cchDomain,

@@ -98,8 +98,9 @@ IFACEMETHODIMP CTacProvider::SetUsageScenario(CREDENTIAL_PROVIDER_USAGE_SCENARIO
 }
 
 // A qualified name is local when the part before the backslash is this computer.
-// "CONTOSO\alice" or "MicrosoftAccount\..." are not, and get no tile: the secret
-// is stored per bare name and this demo authenticates only against the local SAM.
+// "CONTOSO\alice" or "MicrosoftAccount\..." are not, and get no tile: secrets
+// exist only for SIDs of local accounts, and this demo authenticates only against
+// the local SAM.
 static bool IsLocalAccount(PCWSTR qualified)
 {
     const wchar_t* slash = qualified ? wcschr(qualified, L'\\') : nullptr;
