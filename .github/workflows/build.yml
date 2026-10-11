@@ -34,6 +34,42 @@ jobs:
           }
           if ($bad) { throw "$bad PowerShell parse error(s)" }
 
+      # The installers run in Windows PowerShell 5.1 with
+      # ErrorActionPreference 'Stop'. There, 2>&1 on reg.exe turned its
+      # success message on stderr into a terminating error, right after a
+      # good import. Run the helper the installer uses, in 5.1, both ways.
+      - name: reg import helper in Windows PowerShell 5.1
+        shell: powershell
+        # GitHub's powershell shell ends a step with `exit $LASTEXITCODE`, so
+        # the step ends with an explicit exit: the last reg.exe call here is
+        # the one that is supposed to fail. ::error:: and ::notice:: lines
+        # show up as annotations on the run.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\install-doppio.ps1).Path, [ref]$tokens, [ref]$errors)
+            $fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-RegImport' }, $true) | Select-Object -First 1
+            if (-not $fn) { throw 'Invoke-RegImport not found in install-doppio.ps1' }
+            . ([scriptblock]::Create($fn.Extent.Text))
+
+            $reg = Join-Path $env:RUNNER_TEMP 'doppio-ci.reg'
+            $text = "Windows Registry Editor Version 5.00`r`n`r`n[HKEY_CURRENT_USER\Software\DoppioCiTest]`r`n`"x`"=`"1`"`r`n"
+            Set-Content -LiteralPath $reg -Value $text -Encoding Unicode
+            Invoke-RegImport -Path $reg
+            if (-not (Test-Path 'HKCU:\Software\DoppioCiTest')) { throw 'the good import did not create the key' }
+            Remove-Item 'HKCU:\Software\DoppioCiTest' -Recurse
+
+            $threw = $false
+            try { Invoke-RegImport -Path (Join-Path $env:RUNNER_TEMP 'does-not-exist.reg') } catch { $threw = $true }
+            if (-not $threw) { throw 'a failed import did not throw' }
+          } catch {
+            Write-Host "::error::reg import helper: $($_.Exception.Message)"
+            exit 1
+          }
+          Write-Host '::notice::Invoke-RegImport in Windows PowerShell 5.1: a good import passes, a failed one throws.'
+          exit 0
+
       - name: Check that every binary has Control Flow Guard
         shell: pwsh
         run: |
