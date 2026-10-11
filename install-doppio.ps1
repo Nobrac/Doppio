@@ -41,6 +41,26 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# reg.exe writes even its success message, "The operation completed
+# successfully.", to stderr. In Windows PowerShell 5.1, 2>&1 turns every
+# stderr line into an error record, and with ErrorActionPreference 'Stop'
+# that ends the script right after a successful import. So the call runs
+# with 'Continue', and only reg.exe's exit code decides.
+function Invoke-RegImport {
+    param([Parameter(Mandatory)][string]$Path)
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out  = & reg.exe import $Path 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+    if ($code -ne 0) {
+        throw "reg import $(Split-Path $Path -Leaf) failed (exit $code): $($out -join ' ')"
+    }
+}
+
 # Belongs in the Doppio repository root, next to build.bat. Part 1 does the
 # same with `reg import register.reg`; this script exists because a .reg import
 # cannot look before it leaps - it overwrites whatever is at those keys and
@@ -117,8 +137,7 @@ if ($EnableFilter) {
         }
     }
 
-    $out = & reg.exe import $filterReg 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "reg import register-filter.reg failed: $out" }
+    Invoke-RegImport -Path $filterReg
 
     Write-Host "Registered the filter. The logon and unlock screens now show only the 2FA tiles."
     Write-Host ''
@@ -174,8 +193,7 @@ foreach ($f in $required + $optional) {
 
 Write-Host ""
 Write-Host "Registering the credential provider..."
-$out = & reg.exe import $regFile 2>&1
-if ($LASTEXITCODE -ne 0) { throw "reg import register.reg failed: $out" }
+Invoke-RegImport -Path $regFile
 
 Write-Host ""
 Write-Host "Installed to $dest. The other sign-in options stay visible for now."
