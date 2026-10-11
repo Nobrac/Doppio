@@ -14,11 +14,17 @@
 //
 // Be clear about what that is worth: NOTHING as a security control. A logon
 // only reaches this package if the caller asks for it by package id, and every
-// such logon fails anyway - denied, or declined with STATUS_NOT_IMPLEMENTED,
-// because this package never builds a token. No real logon path is closed by
-// loading it. It is here to show the LSA package interface and the logging,
-// nothing more. The path that actually matters is the sub-authentication
-// filter (subauth.cpp) or, on a real machine, the user rights.
+// such logon fails anyway - denied with STATUS_ACCOUNT_RESTRICTION, or declined
+// with STATUS_INVALID_LOGON_TYPE, because this package never builds a token. No
+// real logon path is closed by loading it. It is here to show the LSA package
+// interface and the logging, nothing more. The path that actually matters is
+// the sub-authentication filter (subauth.cpp) or, on a real machine, the user
+// rights.
+//
+// It does follow the lsass rules in lsasafe.h all the same (no heap or CRT of
+// our own on the logon path, SEH around the decision), because the DLL is
+// loaded into lsass at every boot once it is registered, and "it fails the
+// logon anyway" is no comfort if it faults while doing so.
 //
 // WARNING: this code runs in lsass.exe. A bug here does not fail one tile - it
 // can crash LSA and leave the machine unbootable, past Safe Mode. Only ever

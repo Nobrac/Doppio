@@ -1,4 +1,4 @@
-import hmac, hashlib, struct
+import hmac, hashlib, struct, sys
 
 BASE32="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
 
@@ -61,6 +61,7 @@ print("decode==seed:", dec==seed)
 
 # Known: base32 of ASCII "12345678901234567890" is GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ
 print("matches known GEZD... :", enc=="GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
+ok_all &= dec==seed and enc=="GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
 
 # --- faithful port of my C++ ValidateTotp (with replay protection) ---
 def validate(key, code, now, last_step, step=30, digits=6, window=1):
@@ -89,3 +90,6 @@ for k,v in checks.items(): print(f"{k:<34} {'OK' if v else 'FAIL'}")
 ok_all &= all(checks.values())
 
 print("\nALL CHECKS PASS:", ok_all)
+
+# CI runs this script on its own; without a failing exit code it could never go red.
+sys.exit(0 if ok_all else 1)

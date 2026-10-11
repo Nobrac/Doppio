@@ -18,19 +18,19 @@ cd /d "%~dp0"
 echo.
 echo === Building TacAuthPackage.dll (LSA authentication package, SKELETON) ===
 cl /nologo /LD /MT /O2 /guard:cf /EHsc /std:c++17 /W4 /sdl /DUNICODE /D_UNICODE ^
-   ap.cpp store.cpp totp.cpp ^
+   ap.cpp store_index.cpp ^
    /Fe:TacAuthPackage.dll ^
-   /link /guard:cf /DEF:TacAuthPackage.def ^
-   advapi32.lib crypt32.lib bcrypt.lib
+   /link /guard:cf /CETCOMPAT /DEF:TacAuthPackage.def ^
+   advapi32.lib
 if errorlevel 1 goto :fail
 
 echo.
 echo === Building TacSubAuth.dll (MSV1_0 sub-authentication filter, SKELETON) ===
 cl /nologo /LD /MT /O2 /guard:cf /EHsc /std:c++17 /W4 /sdl /DUNICODE /D_UNICODE ^
-   subauth.cpp store.cpp totp.cpp ^
+   subauth.cpp store_index.cpp ^
    /Fe:TacSubAuth.dll ^
-   /link /guard:cf /DEF:TacSubAuth.def ^
-   advapi32.lib crypt32.lib bcrypt.lib
+   /link /guard:cf /CETCOMPAT /DEF:TacSubAuth.def ^
+   advapi32.lib
 if errorlevel 1 goto :fail
 
 echo.

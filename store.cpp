@@ -1,20 +1,24 @@
 #include "store.h"
+#include "storekeys.h"
 #include "totp.h"
 #include <wincrypt.h>
 #include <sddl.h>
-#include <cwctype>
-#include <cstdio>
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
 
+// The index reads that run inside lsass (EnrollmentByRid, EnrollmentByName,
+// NormalizeUserInto) live in store_index.cpp, so the LSA DLLs do not have to
+// link DPAPI and TOTP code they never use. Everything here runs in LogonUI or
+// enroll.exe only.
+
 namespace tac
 {
-    static const wchar_t kKeyPath[]   = L"SOFTWARE\\TheAdminCafe\\2FA";
-    static const wchar_t kStatePath[] = L"SOFTWARE\\TheAdminCafe\\2FA\\State";
-    // Enrollment indexes for the LSA hot path (presence only, no secret).
-    static const wchar_t kNamePath[]  = L"SOFTWARE\\TheAdminCafe\\2FA\\Names";
-    static const wchar_t kRidPath[]   = L"SOFTWARE\\TheAdminCafe\\2FA\\Rids";
+    using keys::kSecrets;
+    using keys::kState;
+    using keys::kNames;
+    using keys::kRids;
+    using keys::kMaxNameCch;
 
     // SYSTEM and Administrators only. "P" blocks the inherited ACL of
     // HKLM\SOFTWARE, which would let every user read the key.
@@ -22,13 +26,10 @@ namespace tac
 
     std::wstring NormalizeUser(const std::wstring& user)
     {
-        std::wstring name = user;
-        size_t pos = name.find_last_of(L'\\');
-        if (pos != std::wstring::npos)
-            name = name.substr(pos + 1);
-        for (wchar_t& c : name)
-            c = static_cast<wchar_t>(towlower(c));
-        return name;
+        WCHAR buf[kMaxNameCch];
+        if (!NormalizeUserInto(user.c_str(), user.size(), buf, ARRAYSIZE(buf)))
+            return std::wstring();
+        return std::wstring(buf);
     }
 
     static bool Protect(const std::string& plain, std::vector<BYTE>& blob)
@@ -99,7 +100,7 @@ namespace tac
     }
 
     // Only SIDs are used as value names. This keeps odd input out of the registry.
-    static bool IsSidString(const std::wstring& sid)
+    bool IsSidString(const std::wstring& sid)
     {
         return sid.size() > 4 && sid.compare(0, 4, L"S-1-") == 0;
     }
@@ -148,8 +149,10 @@ namespace tac
     }
 
     // Creates or opens a key below HKLM with our ACL. The security attributes
-    // only apply when the key is created. An existing key might still carry a
-    // weaker ACL, so it is set again.
+    // only apply when the key is CREATED; an existing key keeps whatever ACL it
+    // has. Repairing one needs WRITE_DAC and a hive write, neither of which
+    // belongs on the logon path (SaveState runs there on every code attempt),
+    // so that is EnsureStoreAcls' job and enroll.exe calls it.
     static LSTATUS OpenProtectedKey(const wchar_t* path, HKEY* phKey)
     {
         PSECURITY_DESCRIPTOR psd = nullptr;
@@ -158,22 +161,40 @@ namespace tac
             return static_cast<LSTATUS>(GetLastError());
 
         SECURITY_ATTRIBUTES sa = { sizeof(sa), psd, FALSE };
-        DWORD disposition = 0;
         LSTATUS status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, nullptr, 0,
-                                         KEY_SET_VALUE | KEY_QUERY_VALUE | WRITE_DAC,
-                                         &sa, phKey, &disposition);
-        if (status == ERROR_SUCCESS && disposition == REG_OPENED_EXISTING_KEY)
+                                         KEY_SET_VALUE | KEY_QUERY_VALUE,
+                                         &sa, phKey, nullptr);
+        LocalFree(psd);
+        return status;
+    }
+
+    bool EnsureStoreAcls()
+    {
+        PSECURITY_DESCRIPTOR psd = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(kKeySddl, SDDL_REVISION_1,
+                                                                  &psd, nullptr))
+            return false;
+
+        bool ok = true;
+        const wchar_t* paths[] = { kSecrets, kState, kNames, kRids };
+        for (const wchar_t* path : paths)
         {
-            status = RegSetKeySecurity(*phKey, DACL_SECURITY_INFORMATION, psd);
+            HKEY hKey = nullptr;
+            LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, WRITE_DAC, &hKey);
+            if (status == ERROR_FILE_NOT_FOUND)
+                continue;                   // not there yet, nothing to repair
             if (status != ERROR_SUCCESS)
             {
-                RegCloseKey(*phKey);
-                *phKey = nullptr;
+                ok = false;
+                continue;
             }
+            if (RegSetKeySecurity(hKey, DACL_SECURITY_INFORMATION, psd) != ERROR_SUCCESS)
+                ok = false;
+            RegCloseKey(hKey);
         }
 
         LocalFree(psd);
-        return status;
+        return ok;
     }
 
     // Deletes one value and treats "was not there" as done.
@@ -212,11 +233,48 @@ namespace tac
 
         DWORD rid = 0;
         if (RidFromSidString(sid, rid))
-            ridOk = SetFlag(kRidPath, std::to_wstring(rid));
+            ridOk = SetFlag(kRids, std::to_wstring(rid));
 
         std::wstring name;
         if (NameFromSid(sid, name))
-            nameOk = SetFlag(kNamePath, name);
+            nameOk = SetFlag(kNames, name);
+    }
+
+    // Every REG_BINARY value under a SID name in the secret store. Shared by
+    // QueryAnyEnrollment, ListEnrollments and ReindexEnrollments so all three
+    // agree on what counts as an enrollment.
+    static bool CollectEnrolledSids(std::vector<std::wstring>& sids)
+    {
+        sids.clear();
+
+        HKEY hKey = nullptr;
+        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSecrets, 0, KEY_QUERY_VALUE, &hKey);
+        if (status == ERROR_FILE_NOT_FOUND)
+            return true;                    // nothing enrolled yet
+        if (status != ERROR_SUCCESS)
+            return false;
+
+        for (DWORD i = 0;; ++i)
+        {
+            WCHAR name[256];
+            DWORD cch = ARRAYSIZE(name);
+            DWORD type = 0;
+            status = RegEnumValueW(hKey, i, name, &cch, nullptr, &type, nullptr, nullptr);
+            if (status == ERROR_NO_MORE_ITEMS)
+                break;
+            if (status == ERROR_MORE_DATA)
+                continue;                   // not one of ours, SIDs are short
+            if (status != ERROR_SUCCESS)
+            {
+                RegCloseKey(hKey);
+                return false;
+            }
+            if (type == REG_BINARY && IsSidString(std::wstring(name, cch)))
+                sids.emplace_back(name, cch);
+        }
+
+        RegCloseKey(hKey);
+        return true;
     }
 
     bool StoreSecret(const std::wstring& sid, const std::string& base32Secret)
@@ -240,7 +298,7 @@ namespace tac
             return false;
 
         HKEY hKey = nullptr;
-        LSTATUS status = OpenProtectedKey(kKeyPath, &hKey);
+        LSTATUS status = OpenProtectedKey(kSecrets, &hKey);
         if (status == ERROR_SUCCESS)
         {
             status = RegSetValueExW(hKey, sid.c_str(), 0, REG_BINARY,
@@ -257,7 +315,7 @@ namespace tac
             return false;
 
         HKEY hKey = nullptr;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKeyPath, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSecrets, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
             return false;
 
         DWORD type = 0;
@@ -292,76 +350,6 @@ namespace tac
         return true;
     }
 
-    // The RID as the decimal value name of the Rids index, without the CRT.
-    // This runs inside lsass, where swprintf_s on an overflow would end the
-    // process. A DWORD has at most 10 digits, so out[12] always fits.
-    static void RidToValueName(DWORD rid, WCHAR (&out)[12])
-    {
-        WCHAR digits[10];
-        int n = 0;
-        do
-        {
-            digits[n++] = static_cast<WCHAR>(L'0' + rid % 10);
-            rid /= 10;
-        } while (rid != 0 && n < 10);
-
-        int i = 0;
-        while (n > 0)
-            out[i++] = digits[--n];
-        out[i] = L'\0';                   // i <= 10, so this is in bounds
-    }
-
-    Enrollment EnrollmentByRid(DWORD rid)
-    {
-        if (rid == 0)
-            return Enrollment::No;
-
-        // A single registry read, like IsEnrolledByName below. Only a value
-        // that is really not there counts as "not enrolled". Any other failure
-        // is Unknown: a filter that read it as "not enrolled" would wave an
-        // enrolled account through on one unexpected error.
-        HKEY hKey = nullptr;
-        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRidPath, 0, KEY_QUERY_VALUE, &hKey);
-        if (status == ERROR_FILE_NOT_FOUND)
-            return Enrollment::No;        // no index on this machine at all
-        if (status != ERROR_SUCCESS)
-            return Enrollment::Unknown;
-
-        WCHAR value[12];
-        RidToValueName(rid, value);
-        status = RegQueryValueExW(hKey, value, nullptr, nullptr, nullptr, nullptr);
-        RegCloseKey(hKey);
-
-        if (status == ERROR_SUCCESS)
-            return Enrollment::Yes;
-        if (status == ERROR_FILE_NOT_FOUND)
-            return Enrollment::No;
-        return Enrollment::Unknown;
-    }
-
-    bool IsEnrolledByRid(DWORD rid)
-    {
-        return EnrollmentByRid(rid) == Enrollment::Yes;
-    }
-
-    bool IsEnrolledByName(const std::wstring& user)
-    {
-        std::wstring name = NormalizeUser(user);
-        if (name.empty())
-            return false;
-
-        // A single registry read. No DPAPI, no LookupAccount* - nothing that
-        // re-enters LSA - so this is safe to call from inside lsass on the
-        // logon path.
-        HKEY hKey = nullptr;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kNamePath, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
-            return false;
-
-        LSTATUS status = RegQueryValueExW(hKey, name.c_str(), nullptr, nullptr, nullptr, nullptr);
-        RegCloseKey(hKey);
-        return status == ERROR_SUCCESS;
-    }
-
     bool RemoveEnrollment(const std::wstring& user, const std::wstring& sid)
     {
         bool ok = true;
@@ -371,7 +359,7 @@ namespace tac
         // account is harmless, the SAM never hands that RID out again.
         std::wstring typed = NormalizeUser(user);
         if (!typed.empty())
-            ok = DeleteValue(kNamePath, typed) && ok;
+            ok = DeleteValue(kNames, typed) && ok;
 
         if (IsSidString(sid))
         {
@@ -381,14 +369,14 @@ namespace tac
             // remove the canonical one as well. Deleting a value twice is free.
             std::wstring canonical;
             if (NameFromSid(sid, canonical) && !canonical.empty() && canonical != typed)
-                ok = DeleteValue(kNamePath, canonical) && ok;
+                ok = DeleteValue(kNames, canonical) && ok;
 
             DWORD rid = 0;
             if (RidFromSidString(sid, rid))
-                ok = DeleteValue(kRidPath, std::to_wstring(rid)) && ok;
+                ok = DeleteValue(kRids, std::to_wstring(rid)) && ok;
 
-            ok = DeleteValue(kKeyPath, sid) && ok;
-            ok = DeleteValue(kStatePath, sid) && ok;
+            ok = DeleteValue(kSecrets, sid) && ok;
+            ok = DeleteValue(kState, sid) && ok;
         }
         return ok;
     }
@@ -396,20 +384,47 @@ namespace tac
     bool QueryAnyEnrollment(bool& any)
     {
         any = false;
-        HKEY hKey = nullptr;
-        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKeyPath, 0, KEY_QUERY_VALUE, &hKey);
-        if (status == ERROR_FILE_NOT_FOUND)
-            return true;
-        if (status != ERROR_SUCCESS)
+
+        // Counts stored secrets, not values: a stray value of another type or
+        // name is not an enrollment. The credential provider's filter hides
+        // every other sign-in option as soon as this says yes, and it must not
+        // do that while nothing on the machine can actually authenticate.
+        std::vector<std::wstring> sids;
+        if (!CollectEnrolledSids(sids))
             return false;
 
-        DWORD values = 0;
-        status = RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                  &values, nullptr, nullptr, nullptr, nullptr);
-        RegCloseKey(hKey);
-        if (status != ERROR_SUCCESS)
+        any = !sids.empty();
+        return true;
+    }
+
+    bool ListEnrollments(std::vector<EnrollmentEntry>& out)
+    {
+        out.clear();
+
+        std::vector<std::wstring> sids;
+        if (!CollectEnrolledSids(sids))
             return false;
-        any = values > 0;
+
+        for (const std::wstring& sid : sids)
+        {
+            EnrollmentEntry e;
+            e.sid         = sid;
+            e.rid         = 0;
+            e.ridIndexed  = false;
+            e.nameIndexed = false;
+
+            if (RidFromSidString(sid, e.rid))
+                e.ridIndexed = EnrollmentByRid(e.rid) == Enrollment::Yes;
+
+            std::wstring name;
+            if (NameFromSid(sid, name))
+            {
+                e.name = name;
+                e.nameIndexed = EnrollmentByName(name.c_str(), name.size()) == Enrollment::Yes;
+            }
+
+            out.push_back(e);
+        }
         return true;
     }
 
@@ -417,7 +432,7 @@ namespace tac
     {
         // HKLM\SOFTWARE\TheAdminCafe\2FA and everything below it, then the
         // vendor key if nothing else lives there.
-        LSTATUS status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, kKeyPath);
+        LSTATUS status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, kSecrets);
         if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND)
             return false;
         status = RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\TheAdminCafe");
@@ -428,35 +443,12 @@ namespace tac
 
     int ReindexEnrollments()
     {
-        HKEY hKey = nullptr;
-        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKeyPath, 0, KEY_QUERY_VALUE, &hKey);
-        if (status == ERROR_FILE_NOT_FOUND)
-            return 0;                           // nothing enrolled yet
-        if (status != ERROR_SUCCESS)
-            return -1;
-
-        // Collect first, write afterwards: the index keys are subkeys of this
-        // one, and enumerating while writing elsewhere is simpler to reason about.
+        // Collect first, write afterwards: the index keys are subkeys of the
+        // secret store, and enumerating while writing elsewhere is simpler to
+        // reason about.
         std::vector<std::wstring> sids;
-        for (DWORD i = 0;; ++i)
-        {
-            WCHAR name[256];
-            DWORD cch = ARRAYSIZE(name);
-            DWORD type = 0;
-            status = RegEnumValueW(hKey, i, name, &cch, nullptr, &type, nullptr, nullptr);
-            if (status == ERROR_NO_MORE_ITEMS)
-                break;
-            if (status == ERROR_MORE_DATA)
-                continue;                       // not one of ours, SIDs are short
-            if (status != ERROR_SUCCESS)
-            {
-                RegCloseKey(hKey);
-                return -1;
-            }
-            if (type == REG_BINARY && IsSidString(name))
-                sids.emplace_back(name, cch);
-        }
-        RegCloseKey(hKey);
+        if (!CollectEnrolledSids(sids))
+            return -1;
 
         // The RID index is what the sub-authentication filter reads, so a
         // failure there is an error. A missing name is not: the account may
@@ -480,7 +472,7 @@ namespace tac
             return false;
 
         HKEY hKey = nullptr;
-        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kStatePath, 0, KEY_QUERY_VALUE, &hKey);
+        LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kState, 0, KEY_QUERY_VALUE, &hKey);
         if (status == ERROR_FILE_NOT_FOUND)
             return true;                      // nobody has logged on yet
         if (status != ERROR_SUCCESS)
@@ -508,7 +500,7 @@ namespace tac
             return false;
 
         HKEY hKey = nullptr;
-        LSTATUS status = OpenProtectedKey(kStatePath, &hKey);
+        LSTATUS status = OpenProtectedKey(kState, &hKey);
         if (status == ERROR_SUCCESS)
         {
             status = RegSetValueExW(hKey, sid.c_str(), 0, REG_BINARY,
@@ -526,6 +518,6 @@ namespace tac
     {
         if (!IsSidString(sid))
             return false;
-        return DeleteValue(kStatePath, sid);
+        return DeleteValue(kState, sid);
     }
 }

@@ -2,6 +2,7 @@
 #include "store.h"
 #include "statelock.h"
 #include <bcrypt.h>
+#include <sddl.h>
 #include <conio.h>
 #include <cctype>
 #include <cstdio>
@@ -75,20 +76,60 @@ static int Unlock(const std::wstring& user, const std::wstring& sid)
 // entry, and that is the one that would otherwise keep denying network logons.
 static int Remove(const std::wstring& user, const std::wstring& sid)
 {
+    const std::wstring& shown = user.empty() ? sid : user;
+
     if (sid.empty())
-        wprintf(L"'%s' is not a local user account (anymore). Removing the name entry only.\n",
+        wprintf(L"'%s' is not a local user account (anymore). Removing the name entry only.\n"
+                L"For the secret of a deleted account, use the SID from 'enroll /list'.\n",
                 user.c_str());
 
     if (!tac::RemoveEnrollment(user, sid))
     {
         wprintf(L"Could not remove the enrollment of '%s'. Run this from an elevated prompt.\n",
-                user.c_str());
+                shown.c_str());
         return 1;
     }
 
-    wprintf(L"Removed the enrollment of '%s'.\n", user.c_str());
+    wprintf(L"Removed the enrollment of '%s'.\n", shown.c_str());
     wprintf(L"The account can log on with its password alone again, unless you also\n");
     wprintf(L"set the deny rights (deny-noninteractive.ps1).\n");
+    return 0;
+}
+
+// Lists every stored secret, the account it belongs to and whether the two
+// indexes the LSA packages read know about it. A secret whose SID no longer
+// resolves belongs to a deleted account: it can never authenticate, but it
+// still counts as "enrolled" for the filter, so remove it by SID.
+static int List()
+{
+    std::vector<tac::EnrollmentEntry> entries;
+    if (!tac::ListEnrollments(entries))
+    {
+        wprintf(L"Could not read the enrollments. Run this from an elevated prompt.\n");
+        return 1;
+    }
+    if (entries.empty())
+    {
+        wprintf(L"No account is enrolled. The filter hides nothing.\n");
+        return 0;
+    }
+
+    bool orphans = false;
+    for (const tac::EnrollmentEntry& e : entries)
+    {
+        const bool gone = e.name.empty();
+        orphans = orphans || gone;
+        wprintf(L"  %-20s %s  RID index: %s  name index: %s\n",
+                gone ? L"(deleted account)" : e.name.c_str(), e.sid.c_str(),
+                e.ridIndexed ? L"yes" : L"NO",
+                gone ? L"-" : (e.nameIndexed ? L"yes" : L"NO"));
+    }
+
+    if (orphans)
+    {
+        wprintf(L"\nA deleted account still counts as enrolled, so the filter keeps hiding the\n");
+        wprintf(L"other sign-in options. Remove it with: enroll /remove <SID>\n");
+    }
     return 0;
 }
 
@@ -175,39 +216,86 @@ static int Purge()
     return 0;
 }
 
+// Parses a SID typed on the command line and returns it in the canonical form
+// the store uses as value name ("S-1-5-21-..."). Stricter than the "S-1-"
+// prefix check, so a local user who happens to be called "S-1-x" is not
+// mistaken for one, and "s-1-5-..." in lower case still finds its entries.
+static bool CanonicalSid(const wchar_t* text, std::wstring& sid)
+{
+    sid.clear();
+    PSID psid = nullptr;
+    if (!ConvertStringSidToSidW(text, &psid))
+        return false;
+
+    PWSTR canonical = nullptr;
+    const BOOL ok = ConvertSidToStringSidW(psid, &canonical);
+    LocalFree(psid);
+    if (!ok)
+        return false;
+
+    sid = canonical;
+    LocalFree(canonical);
+    return true;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc == 2 && _wcsicmp(argv[1], L"/reindex") == 0)
-        return Reindex();
+    if (argc == 2 && _wcsicmp(argv[1], L"/list") == 0)
+        return List();
     if (argc == 2 && _wcsicmp(argv[1], L"/purge") == 0)
         return Purge();
 
-    bool unlock = argc == 3 && _wcsicmp(argv[1], L"/unlock") == 0;
-    bool remove = argc == 3 && _wcsicmp(argv[1], L"/remove") == 0;
-    if ((argc != 2 && !unlock && !remove) || (argc == 2 && argv[1][0] == L'/'))
+    const bool reindex = argc == 2 && _wcsicmp(argv[1], L"/reindex") == 0;
+    const bool unlock  = argc == 3 && _wcsicmp(argv[1], L"/unlock") == 0;
+    const bool remove  = argc == 3 && _wcsicmp(argv[1], L"/remove") == 0;
+    if (!reindex &&
+        ((argc != 2 && !unlock && !remove) || (argc == 2 && argv[1][0] == L'/')))
     {
         wprintf(L"Usage: enroll <local username>\n");
         wprintf(L"       enroll /unlock <local username>\n");
-        wprintf(L"       enroll /remove <local username>\n");
+        wprintf(L"       enroll /remove <local username | SID>\n");
+        wprintf(L"       enroll /list           (enrolled accounts and index state)\n");
         wprintf(L"       enroll /reindex\n");
         wprintf(L"       enroll /purge          (delete all 2FA data)\n");
         return 1;
     }
 
+    // Repair the ACL of store keys an older version created with a weaker one.
+    // This used to happen on every state write, i.e. on every logon attempt;
+    // it needs WRITE_DAC and a hive write and belongs here instead.
+    if (!tac::EnsureStoreAcls())
+        wprintf(L"Warning: could not re-apply the ACL to the existing 2FA registry keys.\n");
+
+    if (reindex)
+        return Reindex();
+
+    const wchar_t* arg = argv[(unlock || remove) ? 2 : 1];
+
     // Only names that exist as a local user account on this machine. The
     // secret is stored under the SID of that account.
-    std::wstring user = tac::NormalizeUser(argv[(unlock || remove) ? 2 : 1]);
+    std::wstring user = tac::NormalizeUser(arg);
     std::wstring sid;
     if (!tac::ResolveLocalUserSid(user, sid))
     {
         // For /remove an unresolvable name is not fatal: the name-keyed index
-        // entry can and should still go. Everything else needs the SID.
+        // entry can and should still go. A SID (from `enroll /list`) removes
+        // the secret of an account that was already deleted. Everything else
+        // needs a live account.
         if (!remove)
         {
             wprintf(L"'%s' is not a local user account on this machine.\n", user.c_str());
             return 1;
         }
-        sid.clear();
+        if (CanonicalSid(arg, sid))
+            user.clear();
+        else
+            sid.clear();
+
+        if (user.empty() && sid.empty())
+        {
+            wprintf(L"'%s' is neither a user name nor a SID.\n", arg);
+            return 1;
+        }
     }
 
     if (unlock)
