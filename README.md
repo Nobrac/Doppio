@@ -168,8 +168,9 @@ The filter leaves `LogoffTime` and `KickoffTime` alone; what MSV1_0 hands in
 there is undocumented, so every call writes the incoming values to the
 debugger. Logons where the server gets the password in clear (type 8,
 NetworkCleartext, e.g. WinRM or IIS with Basic auth) most likely reach the
-filter as an interactive logon level and get no objection - check that in the
-VM before you rely on it, and keep the deny rights for those paths.
+filter as an interactive logon level and get no objection. Untested: check in
+the VM which LogonLevel arrives, and whether the deny right for network logons
+catches type 8.
 
 Earlier versions exported `Msv1_0SubAuthenticationRoutine` under `Auth1..4`.
 That is the wrong hook: it only runs for logons that ask for it, and when it
