@@ -29,6 +29,19 @@ if (($lsaProps.RunAsPPL -in 1, 2) -or ($lsaProps.RunAsPPLBoot -in 1, 2)) {
     throw "LSA protection (RunAsPPL) is on. lsass will not load the unsigned $dll.dll. Turn it off in the test VM first (and back on afterwards)."
 }
 
+# The registry is not the whole story. Windows 11 22H2 and later turns LSA
+# protection on by default on new, enterprise-joined, HVCI-capable devices, and
+# Microsoft does not document that this shows up in RunAsPPL. What it does
+# document is the proof at runtime: WinInit event 12, "LSASS.exe was started
+# as a protected process with level: 4", in the System log. Event ID 12 is
+# used by other sources too, hence the provider check.
+$boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$ppl  = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 12; StartTime = $boot } -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProviderName -like '*Wininit*' } | Select-Object -First 1
+if ($ppl) {
+    throw "lsass runs as a protected process since the last boot (WinInit event 12). It will not load the unsigned $dll.dll. Turn LSA protection off in the test VM first (and back on afterwards)."
+}
+
 $key  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
 $name = 'Authentication Packages'
 
