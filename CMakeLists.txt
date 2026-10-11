@@ -12,7 +12,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # These binaries run in LogonUI and lsass: Control Flow Guard and SDL checks, warning level 4.
 if(MSVC)
     add_compile_options(/guard:cf /sdl /W4)
-    add_link_options(/guard:cf)
+    add_link_options(/guard:cf /CETCOMPAT)
 endif()
 
 # --- the credential provider + filter DLL ---
@@ -24,6 +24,7 @@ add_library(TacProvider SHARED
     helpers.cpp
     totp.cpp
     store.cpp
+    store_index.cpp
     verify.cpp
     statelock.cpp
     eventlog.cpp)
@@ -40,6 +41,7 @@ add_executable(enroll
     enroll.cpp
     totp.cpp
     store.cpp
+    store_index.cpp
     statelock.cpp)
 
 target_link_libraries(enroll PRIVATE
@@ -48,13 +50,13 @@ target_link_libraries(enroll PRIVATE
 # --- the LSA authentication package (SKELETON) ---
 # Runs inside lsass.exe. A bug here can leave the machine unbootable.
 # Load only in a throwaway VM with a snapshot. See ap.h and the article.
+# Links only the index reads (store_index.cpp): no DPAPI or TOTP code in lsass.
 add_library(TacAuthPackage SHARED
     ap.cpp
-    store.cpp
-    totp.cpp)
+    store_index.cpp)
 
 target_link_libraries(TacAuthPackage PRIVATE
-    advapi32 crypt32 bcrypt)
+    advapi32)
 
 set_target_properties(TacAuthPackage PROPERTIES
     LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/TacAuthPackage.def\"")
@@ -65,11 +67,10 @@ set_target_properties(TacAuthPackage PROPERTIES
 # Same warnings as above: lsass.exe, VM with snapshot only.
 add_library(TacSubAuth SHARED
     subauth.cpp
-    store.cpp
-    totp.cpp)
+    store_index.cpp)
 
 target_link_libraries(TacSubAuth PRIVATE
-    advapi32 crypt32 bcrypt)
+    advapi32)
 
 set_target_properties(TacSubAuth PROPERTIES
     LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/TacSubAuth.def\"")

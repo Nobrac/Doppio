@@ -1,4 +1,5 @@
 #include "subauth_filter.h"
+#include "lsasafe.h"
 #include "store.h"
 
 #pragma comment(lib, "advapi32.lib")
@@ -6,57 +7,27 @@
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS             ((NTSTATUS)0x00000000L)
 #endif
-#ifndef STATUS_ACCOUNT_RESTRICTION
-#define STATUS_ACCOUNT_RESTRICTION ((NTSTATUS)0xC000006EL)
+// The documentation of Msv1_0SubAuthenticationFilter lists the values this
+// function "must return". STATUS_ACCOUNT_RESTRICTION, which this filter used
+// to veto with, is not among them; STATUS_INVALID_WORKSTATION is, and it says
+// what we mean: this account may not log on over this path.
+#ifndef STATUS_INVALID_WORKSTATION
+#define STATUS_INVALID_WORKSTATION ((NTSTATUS)0xC0000070L)
 #endif
 
-// Everything in this file runs inside lsass.exe, on MSV1_0's logon path. The
-// rules, three of them learned the hard way in Part 3 (Ristretto):
+#ifndef MSV1_0_PASSTHRU
+#define MSV1_0_PASSTHRU            0x01
+#endif
+
+// Everything in this file runs inside lsass.exe, on MSV1_0's logon path, under
+// the rules in lsasafe.h: no heap and no CRT of our own on the decision path,
+// and SEH rather than C++ try/catch. On top of those:
 //
-//  * No heap: fixed stack buffers, no std::wstring, so no std::bad_alloc.
-//  * No CRT on the decision path. swprintf_s calls the invalid-parameter
-//    handler on overflow, and the default handler ends the process - here
-//    lsass, which is a bugcheck. Log lines are built with Buf, which cuts
-//    instead.
-//  * SEH, not C++ try/catch. With /EHsc a catch (...) does not catch an
-//    access violation, and a bad pointer from the caller is the failure that
-//    actually matters here. The decision runs behind one __except.
 //  * A failed enrollment read refuses the logon. In a filter whose only job
 //    is the veto, "could not tell" must never come out as "not enrolled".
 
 namespace
 {
-    // ---- bounded, CRT-free string building ---------------------------
-    class Buf
-    {
-    public:
-        Buf(WCHAR* p, SIZE_T cap) : p_(p), cap_(cap), n_(0)
-        {
-            if (cap_) p_[0] = L'\0';
-        }
-
-        void Str(const WCHAR* s)
-        {
-            if (!s) return;
-            while (*s && n_ + 1 < cap_) p_[n_++] = *s++;
-            if (cap_) p_[n_] = L'\0';
-        }
-
-        void U64(ULONGLONG v)
-        {
-            WCHAR t[21];
-            int i = 0;
-            do { t[i++] = (WCHAR)(L'0' + (ULONG)(v % 10)); v /= 10; } while (v && i < 20);
-            while (i > 0 && n_ + 1 < cap_) p_[n_++] = t[--i];
-            if (cap_) p_[n_] = L'\0';
-        }
-
-    private:
-        WCHAR* p_;
-        SIZE_T cap_;
-        SIZE_T n_;
-    };
-
     // The SAM account name, for the log only. The decision runs on the RID.
     void SamName(const USER_ALL_INFORMATION* ua, WCHAR (&out)[129])
     {
@@ -80,7 +51,7 @@ namespace
         out[cch] = L'\0';
     }
 
-    enum class Verdict { NoObjection, Refused, Unreadable };
+    enum class Verdict { NoObjection, Refused, Unreadable, NotOurs };
 
     // Debug output for every decision; the event log only for refusals. The
     // filter sees every MSV1_0 logon it is called for, so logging approvals to
@@ -88,7 +59,7 @@ namespace
     void Report(Verdict v, ULONG rid, const WCHAR* name, bool isNetwork)
     {
         WCHAR text[256];
-        Buf b(text, ARRAYSIZE(text));
+        tac::Buf b(text, ARRAYSIZE(text));
         switch (v)
         {
         case Verdict::Refused:
@@ -105,6 +76,13 @@ namespace
             b.U64(rid);
             b.Str(L"): the enrollment index could not be read.");
             break;
+        case Verdict::NotOurs:
+            b.Str(L"No objection: pass-through logon for '");
+            b.Str(name);
+            b.Str(L"' (RID ");
+            b.U64(rid);
+            b.Str(L"), the account does not live on this machine.");
+            break;
         default:
             b.Str(L"No objection to a ");
             b.Str(isNetwork ? L"network" : L"non-network");
@@ -116,14 +94,14 @@ namespace
             break;
         }
 
-        WCHAR debug[288];
-        Buf d(debug, ARRAYSIZE(debug));
+        WCHAR debug[352];
+        tac::Buf d(debug, ARRAYSIZE(debug));
         d.Str(L"[Doppio-SubAuth] ");
         d.Str(text);
         d.Str(L"\n");
         OutputDebugStringW(debug);
 
-        if (v == Verdict::NoObjection)
+        if (v == Verdict::NoObjection || v == Verdict::NotOurs)
             return;
         HANDLE h = RegisterEventSourceW(nullptr, L"TheAdminCafe 2FA");
         if (h)
@@ -134,25 +112,26 @@ namespace
         }
     }
 
-    // Which exceptions the __except below swallows. A stack overflow is not
-    // ours to survive: the guard page is gone by the time the filter runs.
-    // Everything else here means a bad pointer from the caller, and on that
-    // one a dead lsass is the worse outcome, so it is caught.
-    LONG DecisionFilter(DWORD code)
+    // The logon hours MSV1_0 passed in, so the VM test can settle what the
+    // filter is actually handed in LogoffTime and KickoffTime. The
+    // documentation calls both [out] and does not say what they hold on the
+    // way in; this filter leaves them alone either way (see the export below),
+    // and the debugger line is how you check that assumption.
+    void ReportTimes(const LARGE_INTEGER* logoff, const LARGE_INTEGER* kickoff)
     {
-        switch (code)
-        {
-        case EXCEPTION_STACK_OVERFLOW:
-        case EXCEPTION_NONCONTINUABLE_EXCEPTION:
-            return EXCEPTION_CONTINUE_SEARCH;
-        default:
-            return EXCEPTION_EXECUTE_HANDLER;
-        }
+        WCHAR text[160];
+        tac::Buf b(text, ARRAYSIZE(text));
+        b.Str(L"[Doppio-SubAuth] incoming LogoffTime=");
+        if (logoff) b.U64(static_cast<ULONGLONG>(logoff->QuadPart)); else b.Str(L"(null)");
+        b.Str(L" KickoffTime=");
+        if (kickoff) b.U64(static_cast<ULONGLONG>(kickoff->QuadPart)); else b.Str(L"(null)");
+        b.Str(L"\n");
+        OutputDebugStringW(text);
     }
 
     // The decision. Split out of the export so the __try frame there holds
     // nothing that needs unwinding (MSVC error C2712 otherwise).
-    NTSTATUS Decide(const USER_ALL_INFORMATION* ua, bool isNetwork)
+    NTSTATUS Decide(const USER_ALL_INFORMATION* ua, bool isNetwork, bool passthru)
     {
         // No SAM record, no decision: MSV1_0 has already validated the logon,
         // so "no objection" does not let anything through that MSV1_0 refused.
@@ -169,6 +148,15 @@ namespace
             return STATUS_SUCCESS;
         }
 
+        // MSV1_0_PASSTHRU means "the user is not connecting to this machine".
+        // Our index only knows local accounts, and a RID from somewhere else
+        // could collide with a local one, so we have nothing to say.
+        if (passthru)
+        {
+            Report(Verdict::NotOurs, rid, name, true);
+            return STATUS_SUCCESS;
+        }
+
         // A single registry read - no DPAPI, no LSA name/SID lookup - so
         // nothing here re-enters LSA from inside MSV1_0.
         switch (tac::EnrollmentByRid(rid))
@@ -182,12 +170,12 @@ namespace
             // enrolled" - that is the one wrong answer that lets an enrolled
             // account through.
             Report(Verdict::Unreadable, rid, name, true);
-            return STATUS_ACCOUNT_RESTRICTION;
+            return STATUS_INVALID_WORKSTATION;
 
         case tac::Enrollment::Yes:
         default:
             Report(Verdict::Refused, rid, name, true);
-            return STATUS_ACCOUNT_RESTRICTION;
+            return STATUS_INVALID_WORKSTATION;
         }
     }
 }
@@ -195,10 +183,20 @@ namespace
 // MSV1_0 calls this AFTER it has validated the logon. We only add a veto;
 // password check, account restrictions and token stay with MSV1_0.
 //
-// The output parameters are left as MSV1_0 passed them in, except WhichFields
-// (nothing to write back to the SAM) and Authoritative on a refusal. In
-// particular LogoffTime and KickoffTime are NOT overwritten: they carry the
-// account's logon hours, and a filter has no business extending them.
+// The documentation calls WhichFields, UserFlags, Authoritative, LogoffTime and
+// KickoffTime [out], so we write the three we can answer for:
+//
+//   * WhichFields = 0: nothing to write back to the SAM.
+//   * UserFlags   = 0: we claim neither LOGON_GUEST nor LOGON_NOENCRYPTION.
+//   * Authoritative = TRUE: the documentation says this "should return valid
+//     information regardless of the return value", and our answer is final on
+//     every path - there is no other domain controller that would decide
+//     differently about a local account.
+//
+// LogoffTime and KickoffTime are deliberately NOT written: they carry the
+// account's logon hours, and a filter has no business extending them. What
+// MSV1_0 hands us there is undocumented, so every call logs the incoming
+// values for the VM test (ReportTimes above).
 //
 // IMPORTANT: we read ONLY the RID and the account name. We never touch the
 // password hashes in UserAll or the challenge-response in LogonInformation.
@@ -207,19 +205,26 @@ namespace
 NTSTATUS NTAPI Msv1_0SubAuthenticationFilter(
     NETLOGON_LOGON_INFO_CLASS LogonLevel,
     PVOID /*LogonInformation*/,
-    ULONG /*Flags*/,
+    ULONG Flags,
     PUSER_ALL_INFORMATION UserAll,
     PULONG WhichFields,
-    PULONG /*UserFlags*/,
+    PULONG UserFlags,
     PBOOLEAN Authoritative,
-    PLARGE_INTEGER /*LogoffTime*/,
-    PLARGE_INTEGER /*KickoffTime*/)
+    PLARGE_INTEGER LogoffTime,
+    PLARGE_INTEGER KickoffTime)
 {
     if (WhichFields)
         *WhichFields = 0;
+    if (UserFlags)
+        *UserFlags = 0;
+    if (Authoritative)
+        *Authoritative = TRUE;
 
     const bool isNetwork = (LogonLevel == NetlogonNetworkInformation ||
                             LogonLevel == NetlogonNetworkTransitiveInformation);
+    const bool passthru  = (Flags & MSV1_0_PASSTHRU) != 0;
+
+    ReportTimes(LogoffTime, KickoffTime);
 
     NTSTATUS result;
 
@@ -229,17 +234,15 @@ NTSTATUS NTAPI Msv1_0SubAuthenticationFilter(
     // state to unwind.
     __try
     {
-        result = Decide(UserAll, isNetwork);
+        result = Decide(UserAll, isNetwork, passthru);
     }
-    __except (DecisionFilter(GetExceptionCode()))
+    __except (tac::LsaDecisionExceptionFilter(GetExceptionCode()))
     {
         OutputDebugStringW(L"[Doppio-SubAuth] Exception while deciding a logon - "
                            L"refused if it was a network logon (fail closed).\n");
-        result = isNetwork ? STATUS_ACCOUNT_RESTRICTION : STATUS_SUCCESS;
+        result = (isNetwork && !passthru) ? STATUS_INVALID_WORKSTATION : STATUS_SUCCESS;
     }
 
-    if (result != STATUS_SUCCESS && Authoritative)
-        *Authoritative = TRUE;              // the refusal is final
     return result;
 }
 

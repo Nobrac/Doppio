@@ -24,7 +24,13 @@
 //
 // Policy of this skeleton: refuse a NETWORK logon for an enrolled account (no UI
 // to type a code there), and raise no objection to anything else. A network
-// logon whose enrollment cannot be read is refused too (fail closed).
+// logon whose enrollment cannot be read is refused too (fail closed). A
+// pass-through logon (MSV1_0_PASSTHRU: the account does not live on this
+// machine) gets no objection either, because the index only knows local RIDs.
+//
+// The veto is STATUS_INVALID_WORKSTATION, which is one of the values the
+// documentation lists for this function. Earlier versions returned
+// STATUS_ACCOUNT_RESTRICTION, which is not in that list.
 //
 // The account is identified by the RID that MSV1_0 read from the SAM
 // (USER_ALL_INFORMATION::UserId), not by the name the client sent. The RID
