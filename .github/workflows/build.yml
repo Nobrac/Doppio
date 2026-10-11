@@ -23,6 +23,17 @@ jobs:
         shell: cmd
         run: build.bat
 
+      - name: Parse every PowerShell script
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem -Filter *.ps1) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { Write-Host "$($f.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $bad++ }
+          }
+          if ($bad) { throw "$bad PowerShell parse error(s)" }
+
       - name: Check that every binary has Control Flow Guard
         shell: pwsh
         run: |
@@ -37,8 +48,18 @@ jobs:
         run: >
           cl /nologo /c /analyze /W4 /EHsc /std:c++17 /DUNICODE /D_UNICODE
           dll.cpp CTacProvider.cpp CTacCredential.cpp CTacFilter.cpp helpers.cpp
-          totp.cpp store.cpp verify.cpp statelock.cpp eventlog.cpp enroll.cpp
-          ap.cpp subauth.cpp
+          totp.cpp store.cpp store_index.cpp verify.cpp statelock.cpp eventlog.cpp
+          enroll.cpp ap.cpp subauth.cpp
+
+      # The code that runs inside lsass gets no free pass: a finding there fails
+      # the build. SDK headers are excluded from the analysis, so only our own
+      # code can trip it.
+      - name: Static analysis of the lsass code (/analyze /WX)
+        shell: cmd
+        run: >
+          cl /nologo /c /analyze /analyze:external- /external:anglebrackets /external:W0
+          /W4 /WX /EHsc /std:c++17 /DUNICODE /D_UNICODE
+          ap.cpp subauth.cpp store_index.cpp
 
   tests:
     runs-on: ubuntu-latest
@@ -46,7 +67,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
-      - name: Native C++ tests (real totp.cpp / verify.cpp)
+      - name: Native C++ tests (totp/verify, and the lsass code under ASan/UBSan)
         run: make -C tests/native
       - name: Python RFC 6238 check
         run: python3 tests/totp_check.py
