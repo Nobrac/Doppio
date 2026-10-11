@@ -25,5 +25,8 @@ public:
 
 private:
     virtual ~CTacFilter() { DllRelease(); }
+
+    // At least one stored secret, or a store that cannot be read.
+    static bool AnyEnrollment();
     LONG _cRef;
 };
