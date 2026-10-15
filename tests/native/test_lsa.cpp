@@ -103,7 +103,12 @@ static void TestFilter()
     CHECK(fake::DebugContains(L"pass-through"));
 
     r = Filter(NetlogonNetworkInformation, 0, 1001, L"", true);
-    CHECK(r.status == kSuccess && OutputsSane(r));               // no SAM record
+    CHECK(r.status == kInvalidWorkst && OutputsSane(r));         // no SAM record: refuse
+    CHECK(fake::DebugContains(L"no SAM record"));
+    r = Filter(NetlogonInteractiveInformation, 0, 1001, L"", true);
+    CHECK(r.status == kSuccess && OutputsSane(r));               // ...but only on the network
+    r = Filter(NetlogonNetworkInformation, MSV1_0_PASSTHRU, 1001, L"", true);
+    CHECK(r.status == kSuccess && OutputsSane(r));               // ...to this machine
 
     std::printf("-- sub-auth filter: fail closed\n");
     fake::keys.erase(kRids);
