@@ -51,7 +51,7 @@ namespace
         out[cch] = L'\0';
     }
 
-    enum class Verdict { NoObjection, Refused, Unreadable, NotOurs };
+    enum class Verdict { NoObjection, Refused, Unreadable, NotOurs, NoRecord };
 
     // Debug output for every decision; the event log only for refusals. The
     // filter sees every MSV1_0 logon it is called for, so logging approvals to
@@ -75,6 +75,10 @@ namespace
             b.Str(L"' (RID ");
             b.U64(rid);
             b.Str(L"): the enrollment index could not be read.");
+            break;
+        case Verdict::NoRecord:
+            b.Str(L"Refused a network logon: MSV1_0 passed no SAM record, so the "
+                  L"account could not be identified.");
             break;
         case Verdict::NotOurs:
             b.Str(L"No objection: pass-through logon for '");
@@ -133,10 +137,18 @@ namespace
     // nothing that needs unwinding (MSVC error C2712 otherwise).
     NTSTATUS Decide(const USER_ALL_INFORMATION* ua, bool isNetwork, bool passthru)
     {
-        // No SAM record, no decision: MSV1_0 has already validated the logon,
-        // so "no objection" does not let anything through that MSV1_0 refused.
+        // No SAM record: without a RID there is no telling whether the account
+        // is enrolled, and "could not tell" must not come out as "no objection"
+        // on the one path this filter exists for. Everything else keeps its
+        // usual answer - non-network logons belong to the credential provider,
+        // pass-through logons to another machine.
         if (!ua)
-            return STATUS_SUCCESS;
+        {
+            if (!isNetwork || passthru)
+                return STATUS_SUCCESS;
+            Report(Verdict::NoRecord, 0, L"?", true);
+            return STATUS_INVALID_WORKSTATION;
+        }
 
         const ULONG rid = ua->UserId;
         WCHAR name[129];
